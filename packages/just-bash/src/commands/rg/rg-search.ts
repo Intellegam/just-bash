@@ -24,6 +24,7 @@ import type { ExecResult, RuntimeCommandContext } from "../../types.js";
 import {
   buildRegex,
   convertReplacement,
+  type PreFilter,
   type RegexResult,
   searchContent,
 } from "../search-engine/index.js";
@@ -187,6 +188,7 @@ export async function executeSearch(
   let aggregatePatternInputBytes = 0;
   let regex: UserRegex;
   let kResetGroup: number | undefined;
+  let preFilter: PreFilter | undefined;
   try {
     // Read patterns from files (-f/--file). Patterns are regex source — decode
     // bytes to UTF-8 so unicode-class patterns work. Scan incrementally instead
@@ -279,6 +281,7 @@ export async function executeSearch(
       );
       regex = regexResult.regex;
       kResetGroup = regexResult.kResetGroup;
+      preFilter = regexResult.preFilter;
     } catch {
       return {
         stdout: "",
@@ -325,6 +328,7 @@ export async function executeSearch(
       passthru: options.passthru,
       multiline: options.multiline,
       kResetGroup,
+      preFilter,
       maxWork: ctx.limits.maxLoopIterations,
       maxMatches: ctx.limits.maxArrayElements,
       signal: ctx.signal,
@@ -415,6 +419,7 @@ export async function executeSearch(
     effectiveLineNumbers,
     stderr,
     kResetGroup,
+    preFilter,
   );
 }
 
@@ -1125,6 +1130,7 @@ async function searchFiles(
   effectiveLineNumbers: boolean,
   collectedErrors: string,
   kResetGroup?: number,
+  preFilter?: PreFilter,
 ): Promise<ExecResult> {
   const matcherCheckpoint = createMatcherCheckpoint(ctx);
   const jsonCheckpoint = createCommandCheckpoint(ctx.executionScope, "rg");
@@ -1197,6 +1203,7 @@ async function searchFiles(
             passthru: options.passthru,
             multiline: options.multiline,
             kResetGroup,
+            preFilter,
             maxWork: ctx.limits.maxLoopIterations,
             maxMatches: ctx.limits.maxArrayElements,
             signal: ctx.signal,
