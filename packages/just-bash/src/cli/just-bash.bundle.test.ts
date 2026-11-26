@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
@@ -153,6 +153,28 @@ describe("just-bash CJS bundle", () => {
     expect(result.stdout).toBe("hello from cjs\n");
     expect(result.exitCode).toBe(0);
   });
+
+  it("should run sqlite3 and stop a runaway query at the shell deadline", async () => {
+    const cjsBundlePath = resolve(__dirname, "../../dist/bundle/index.cjs");
+    const require = createRequire(import.meta.url);
+    const mod = require(cjsBundlePath);
+    const bash = new mod.Bash({
+      executionLimits: {
+        maxExecutionTimeMs: 2_000,
+        maxSqliteTimeoutMs: 30_000,
+      },
+    });
+
+    const query = await bash.exec('sqlite3 :memory: "SELECT 1 + 2"');
+    const started = Date.now();
+    const runaway = await bash.exec(
+      'sqlite3 :memory: "WITH RECURSIVE t(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM t) SELECT sum(x) FROM t"',
+    );
+
+    expect(query).toMatchObject({ stdout: "3\n", stderr: "", exitCode: 0 });
+    expect(runaway.exitCode).toBe(124);
+    expect(Date.now() - started).toBeLessThan(10_000);
+  }, 30_000);
 });
 
 // Regression test for https://github.com/vercel-labs/just-bash/issues/211.
@@ -173,4 +195,51 @@ describe("just-bash ESM bundle", () => {
     expect(result.stdout).toBe("/x.txt: ASCII text\n");
     expect(result.exitCode).toBe(0);
   });
+});
+
+let bunAvailable = false;
+try {
+  execFileSync("bun", ["--version"], { stdio: "ignore" });
+  bunAvailable = true;
+} catch {
+  bunAvailable = false;
+}
+
+// Bun cannot reliably terminate a worker busy inside WebAssembly, which the
+// Node processes above cannot show; the subprocess must also exit by itself,
+// so no worker thread outlives Bash.exec().
+describe.skipIf(!bunAvailable)("sqlite3 cancellation under Bun", () => {
+  for (const entry of ["index.js", "index.cjs"]) {
+    it(`stops a runaway query through ${entry}`, () => {
+      const bundle = resolve(__dirname, "../../dist/bundle", entry);
+      const script = `
+        const mod = ${entry.endsWith(".cjs") ? "require" : "await import"}(${JSON.stringify(bundle)});
+        const bash = new mod.Bash({
+          executionLimits: { maxExecutionTimeMs: 700, maxSqliteTimeoutMs: 30000 },
+        });
+        const started = performance.now();
+        const runaway = await bash.exec(
+          'sqlite3 :memory: "WITH RECURSIVE t(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM t) SELECT sum(x) FROM t"',
+        );
+        const elapsedMs = performance.now() - started;
+        const follow = await bash.exec('sqlite3 :memory: "SELECT 42"');
+        console.log(JSON.stringify({
+          runaway: { exitCode: runaway.exitCode, stderr: runaway.stderr },
+          elapsedMs,
+          follow: follow.stdout,
+        }));
+      `;
+      const output = execFileSync("bun", ["-e", script], {
+        encoding: "utf8",
+        timeout: 20_000,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const result = JSON.parse(output.trim().split("\n").at(-1) ?? "");
+
+      expect(result.runaway.exitCode).toBe(124);
+      expect(result.runaway.stderr).not.toContain("did not exit");
+      expect(result.elapsedMs).toBeLessThan(4_000);
+      expect(result.follow).toBe("42\n");
+    }, 30_000);
+  }
 });

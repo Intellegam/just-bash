@@ -35,6 +35,8 @@ export interface CommandExecutionBudget {
 }
 
 type Cleanup = () => void | Promise<void>;
+/** How long Bash.exec() waits for cancelled worker threads to exit. */
+const WORKER_EXIT_TIMEOUT_MS = 5_000;
 const OUTPUT_RELEASE_AUTHORITY = Object.freeze(Object.create(null) as object);
 
 /**
@@ -55,6 +57,7 @@ export class ExecutionScope {
   private readonly bytesByKind = new Map<string, number>();
   private readonly depthByKind = new Map<string, number>();
   private readonly cleanupCallbacks: Cleanup[] = [];
+  private readonly workerExits: Promise<void>[] = [];
   private poisoned: ExecutionLimitError | ExecutionAbortedError | undefined;
   private closed = false;
   private readonly startedAt = Date.now();
@@ -392,6 +395,41 @@ export class ExecutionScope {
       const index = this.cleanupCallbacks.indexOf(cleanup);
       if (index >= 0) this.cleanupCallbacks.splice(index, 1);
     };
+  }
+
+  /**
+   * @internal Hold public settlement until a native worker thread has exited,
+   * beyond the cleanup grace period: a worker still running after Bash.exec()
+   * returns would keep consuming CPU and memory.
+   */
+  trackWorkerExit(exit: Promise<void>): void {
+    this.workerExits.push(exit);
+  }
+
+  /**
+   * @internal Await every tracked worker exit; false when one has not exited
+   * within WORKER_EXIT_TIMEOUT_MS, as when its termination failed. A `.then`
+   * callback that a command registers under defense-in-depth is dropped once
+   * that execution's defense deactivates, so only this caller-side wait
+   * observes the exits.
+   */
+  async waitForWorkerExits(): Promise<boolean> {
+    const deadline = Date.now() + WORKER_EXIT_TIMEOUT_MS;
+    while (this.workerExits.length > 0) {
+      let timer: ReturnType<typeof _setTimeoutIfFinite>;
+      const exited = await Promise.race([
+        Promise.allSettled(this.workerExits.splice(0)).then(() => true),
+        new Promise<false>((resolve) => {
+          timer = _setTimeoutIfFinite(
+            () => resolve(false),
+            Math.max(0, deadline - Date.now()),
+          );
+        }),
+      ]);
+      _clearFiniteTimeout(timer);
+      if (!exited) return false;
+    }
+    return true;
   }
 
   async close(): Promise<void> {

@@ -722,6 +722,7 @@ export class Bash {
       } catch {
         // The execution error remains the more useful and compatible failure.
       }
+      await executionScope.waitForWorkerExits();
       throw error;
     }
 
@@ -734,6 +735,13 @@ export class Bash {
       finalResult = {
         ...result,
         stderr: `${result.stderr}bash: execution cleanup failed\n`,
+        exitCode: 126,
+      };
+    }
+    if (!(await executionScope.waitForWorkerExits())) {
+      finalResult = {
+        ...finalResult,
+        stderr: `${finalResult.stderr}bash: a worker thread did not exit after cancellation\n`,
         exitCode: 126,
       };
     }

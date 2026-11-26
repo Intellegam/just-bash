@@ -4,21 +4,19 @@
  * This isolates potentially long-running queries so they can be
  * terminated if they exceed the timeout.
  *
- * Uses sql.js (WASM-based SQLite) which is fully sandboxed and cannot
- * access the real filesystem.
+ * Uses sql.js, which is fully sandboxed and cannot access the real
+ * filesystem. Bun cannot reliably terminate a worker that is busy inside
+ * WebAssembly, so under Bun the worker loads sql.js's JavaScript (asm.js)
+ * build; Node keeps the WASM build, which runs queries several times faster.
  *
  * Security: Uses phased defense-in-depth:
- * 1. Init phase: sql.js WASM loads without restrictions
+ * 1. Init phase: sql.js loads without restrictions
  * 2. Defense phase: Activate full blocking after sql.js init
  * 3. Execute phase: User SQL runs with all dangerous globals blocked
  */
 
 import { parentPort, workerData } from "node:worker_threads";
-import initSqlJs, {
-  type Database,
-  type SqlJsStatic,
-  type Statement,
-} from "sql.js";
+import type { Database, SqlJsStatic, Statement } from "sql.js";
 import { sanitizeHostErrorMessage } from "../../fs/sanitize-error.js";
 import {
   WorkerDefenseInDepth,
@@ -77,10 +75,13 @@ async function initializeSqlJs(): Promise<SqlJsStatic> {
     return cachedSQL;
   }
 
-  // Initialize sql.js WASM first (needs unrestricted JS features). Database
+  // Initialize sql.js first (needs unrestricted JS features). Database
   // construction is also prewarmed before defense activation below because
   // sql.js performs some Node module loading lazily on first use.
-  cachedSQL = await initSqlJs();
+  const sqlJs = process.versions.bun
+    ? await import("sql.js/dist/sql-asm-memory-growth.js")
+    : await import("sql.js");
+  cachedSQL = await sqlJs.default();
 
   return cachedSQL;
 }
@@ -101,6 +102,7 @@ export interface WorkerInput {
   options: {
     bail: boolean;
     echo: boolean;
+    readonly: boolean;
   };
   limits: {
     maxResultRows: number;
@@ -271,9 +273,9 @@ async function executeQuery(data: WorkerInput): Promise<WorkerOutput> {
     } else {
       db = new SQL.Database();
     }
-    // V8 worker resourceLimits do not cover WebAssembly linear memory. SQLite's
+    // V8 worker resourceLimits do not cover sql.js's ArrayBuffer heap. SQLite's
     // own hard heap limit stops randomblob/zeroblob and query intermediates
-    // before they can grow the WASM allocator without bound. SQLite only lets
+    // before they can grow that heap without bound. SQLite only lets
     // later PRAGMAs lower (not raise) an established hard limit.
     const sqliteHeapLimit = Math.min(
       MAX_SQLITE_HEAP_LIMIT,
@@ -317,6 +319,8 @@ async function executeQuery(data: WorkerInput): Promise<WorkerOutput> {
     let remainingSql = data.sql;
     while (remainingSql.trim().length > 0) {
       let prepared: Statement;
+      // A guest statement can switch query_only off; reassert it for the next.
+      if (data.options.readonly) db.run("PRAGMA query_only = ON");
       const iterator = db.iterateStatements(remainingSql);
       try {
         const next = iterator.next();
@@ -381,7 +385,7 @@ async function executeQuery(data: WorkerInput): Promise<WorkerOutput> {
     }
 
     let resultBuffer: Uint8Array | null = null;
-    if (hasModifications) {
+    if (hasModifications && !data.options.readonly) {
       const databaseBytes = databaseByteLength(db);
       if (databaseBytes > data.limits.maxDatabaseBytes) {
         throw new Error(

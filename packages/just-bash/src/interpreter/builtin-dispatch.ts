@@ -112,7 +112,9 @@ function createRevocableCommandContext(
   commandName: string,
 ): RevocableCommandContext {
   let active = true;
-  const facadeAbort = context.signal ? new AbortController() : undefined;
+  // Always a signal, so revocation at the shell deadline also cancels a
+  // command's in-flight work when the caller passed no signal.
+  const facadeAbort = new AbortController();
   const wrappedValues = new WeakMap<object, object>();
   const assertActive = () => {
     if (!active) {
@@ -322,7 +324,7 @@ function createRevocableCommandContext(
     sleep: dataDescriptor(wrapFunction(context.sleep)),
     trace: dataDescriptor(wrapFunction(context.trace)),
     invokeTool: dataDescriptor(wrapFunction(context.invokeTool)),
-    signal: dataDescriptor(facadeAbort?.signal),
+    signal: dataDescriptor(facadeAbort.signal),
   });
 
   return {
@@ -332,8 +334,8 @@ function createRevocableCommandContext(
     ) as RuntimeCommandContext,
     revoke() {
       active = false;
-      if (!facadeAbort?.signal.aborted) {
-        facadeAbort?.abort(
+      if (!facadeAbort.signal.aborted) {
+        facadeAbort.abort(
           new ExecutionAbortedError(
             "",
             `bash: ${commandName} context revoked\n`,

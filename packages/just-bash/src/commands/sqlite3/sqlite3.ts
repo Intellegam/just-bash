@@ -1,11 +1,15 @@
 /**
  * sqlite3 - SQLite database CLI
  *
- * Wraps sql.js (WASM) to provide SQLite database access through the virtual filesystem.
+ * Wraps sql.js to provide SQLite database access through the virtual filesystem.
  * Databases are loaded from buffers and written back after modifications.
  *
  * Queries run in a worker thread with a timeout to prevent runaway queries
- * (e.g., infinite recursive CTEs) from blocking execution.
+ * (e.g., infinite recursive CTEs) from blocking execution. Under Bun the
+ * worker loads sql.js's JavaScript build (see worker.ts); `-version` always
+ * uses the WASM build.
+ * Public Bash.exec() settles only after the worker has exited, or reports
+ * that it did not.
  *
  * Security: sql.js is fully sandboxed - it cannot access the real filesystem,
  * making ATTACH DATABASE and VACUUM INTO safe (they only operate on virtual buffers).
@@ -17,7 +21,11 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import initSqlJs from "sql.js";
 import { decodeBytesToUtf8 } from "../../encoding.js";
-import type { ResourceLease } from "../../execution-scope.js";
+import {
+  type CommandExecutionBudget,
+  ExecutionScope,
+  type ResourceLease,
+} from "../../execution-scope.js";
 import {
   sanitizeErrorMessage,
   sanitizeHostErrorMessage,
@@ -372,9 +380,7 @@ async function getSqliteVersion(): Promise<string> {
  *
  * Exposed via `_internals.findWorkerPath` so tests can pass a synthetic dir.
  */
-function findWorkerPath(
-  currentDir: string = dirname(fileURLToPath(import.meta.url)),
-): string {
+function findWorkerPath(currentDir: string = defaultWorkerSearchDir()): string {
   const candidates = [
     join(currentDir, "sqlite3-worker.js"),
     join(currentDir, "../../commands/sqlite3/worker.js"),
@@ -401,6 +407,14 @@ function findWorkerPath(
   throw new Error(
     "sqlite3 worker not found. Run 'pnpm build' to compile the worker.",
   );
+}
+
+function defaultWorkerSearchDir(): string {
+  // esbuild's CommonJS bundle (dist/bundle/index.cjs) has no import.meta.url;
+  // its worker ships beside it in chunks/.
+  return import.meta.url
+    ? dirname(fileURLToPath(import.meta.url))
+    : join(__dirname, "chunks");
 }
 
 /** @internal Exposed for testing only */
@@ -527,6 +541,7 @@ async function executeInWorker(
   input: WorkerInput,
   controller: WorkerRequestController,
   requireDefenseContext: boolean | undefined,
+  executionScope: CommandExecutionBudget | undefined,
 ): Promise<WorkerOutput> {
   // Try to use worker thread for timeout protection
   try {
@@ -602,6 +617,14 @@ async function executeInWorker(
         worker = DefenseInDepthBox.runTrusted(() =>
           _internals.createWorker(workerPath, input),
         );
+        // Cancellation settles this command once termination is requested,
+        // which can precede the thread's exit; Bash.exec() waits for the exit.
+        if (executionScope instanceof ExecutionScope) {
+          const started = worker;
+          executionScope.trackWorkerExit(
+            new Promise((resolve) => started.once("exit", () => resolve())),
+          );
+        }
       } catch (error) {
         controller.close();
         throw error;
@@ -855,6 +878,7 @@ export const sqlite3Command: RuntimeCommand = {
         options: {
           bail: options.bail,
           echo: options.echo,
+          readonly: options.readonly,
         },
         limits: {
           maxResultRows: ctx.limits.maxArrayElements,
@@ -885,6 +909,7 @@ export const sqlite3Command: RuntimeCommand = {
           workerInput,
           requestController,
           ctx.requireDefenseContext,
+          ctx.executionScope,
         );
       } catch (e) {
         const message = sanitizeHostErrorMessage((e as Error).message);
@@ -1003,8 +1028,13 @@ export const sqlite3Command: RuntimeCommand = {
         exitCode: hadError ? 1 : 0,
       };
     } finally {
-      databaseLease?.release();
-      releaseLock?.();
+      // After a cancellation the revoked context makes lease release throw;
+      // the database lock is module state and must still be released.
+      try {
+        databaseLease?.release();
+      } finally {
+        releaseLock?.();
+      }
     }
   },
 };
