@@ -5,9 +5,13 @@
  */
 
 import { decodeBytesToUtf8 } from "../../encoding.js";
+import { createCommandCheckpoint } from "../../execution-scope.js";
 import { rethrowFatalExecutionError } from "../../fatal-execution-error.js";
 import { mapToRecord } from "../../helpers/env.js";
-import { ExecutionLimitError } from "../../interpreter/errors.js";
+import {
+  ExecutionAbortedError,
+  ExecutionLimitError,
+} from "../../interpreter/errors.js";
 import { ConstantRegex, createUserRegex } from "../../regex/index.js";
 import {
   assertDefenseContext,
@@ -158,6 +162,7 @@ export const awkCommand2: RuntimeCommand = {
         : undefined,
       coverage: ctx.coverage,
       requireDefenseContext: ctx.requireDefenseContext,
+      checkpoint: createCommandCheckpoint(ctx.executionScope, "awk"),
     });
     runtimeCtx.FS = fieldSepStr;
     // Use Object.assign with null-prototype to preserve safety
@@ -261,6 +266,7 @@ export const awkCommand2: RuntimeCommand = {
 
         // Use while loop with lineIndex to support getline advancing the line
         while (runtimeCtx.lineIndex < lines.length - 1) {
+          runtimeCtx.checkpoint();
           runtimeCtx.lineIndex++;
           const activeLineIndex = runtimeCtx.lineIndex;
           await withDefenseContext("line execution", () =>
@@ -294,7 +300,8 @@ export const awkCommand2: RuntimeCommand = {
           } catch (e) {
             if (
               e instanceof SecurityViolationError ||
-              e instanceof ExecutionLimitError
+              e instanceof ExecutionLimitError ||
+              e instanceof ExecutionAbortedError
             ) {
               throw e;
             }
@@ -338,14 +345,17 @@ export const awkCommand2: RuntimeCommand = {
       if (e instanceof SecurityViolationError) {
         throw e;
       }
-      // Keep what was printed before the failure; the original error wins
-      // over a failed write here.
+      // Keep what was printed before the failure or deadline; the original
+      // error wins over a failed write here.
       try {
         await withDefenseContext("output flush after error", () =>
           flushOutputFilesAfterFailure(runtimeCtx),
         );
       } catch (flushError) {
         if (flushError instanceof SecurityViolationError) throw flushError;
+      }
+      if (e instanceof ExecutionAbortedError) {
+        throw e;
       }
       // Handle errors during execution
       const msg = e instanceof Error ? e.message : String(e);

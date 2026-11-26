@@ -381,6 +381,7 @@ async function executeWhile(
         ctx.output,
       );
     }
+    ctx.checkpoint();
 
     ctx.loopContinue = false;
     await withDefenseContext(ctx, "while body execution", () =>
@@ -416,6 +417,7 @@ async function executeDoWhile(
         ctx.output,
       );
     }
+    ctx.checkpoint();
 
     ctx.loopContinue = false;
     await withDefenseContext(ctx, "do-while body execution", () =>
@@ -479,6 +481,7 @@ async function executeFor(
         ctx.output,
       );
     }
+    ctx.checkpoint();
 
     ctx.loopContinue = false;
     await withDefenseContext(ctx, "for body execution", () =>
@@ -513,6 +516,7 @@ async function executeForIn(
   if (!array) return;
 
   for (const key of Object.keys(array)) {
+    ctx.checkpoint();
     ctx.vars[stmt.variable] = key;
 
     ctx.loopContinue = false;

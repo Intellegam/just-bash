@@ -3,6 +3,22 @@ import { searchContent } from "./matcher.js";
 import { buildRegex, type PreFilter } from "./regex.js";
 
 describe("preFilterMatches — substring fast-path", () => {
+  it("checks the deadline before each whole-input needle scan in multiline mode", () => {
+    const { regex } = buildRegex("zq", { mode: "basic" });
+    const preFilter: PreFilter = {
+      needles: ["zq", "zr", "zs"],
+      ignoreCase: false,
+    };
+    const calls: (boolean | undefined)[] = [];
+    searchContent("a\nb\n", regex, {
+      multiline: true,
+      preFilter,
+      checkpoint: (force) => calls.push(force),
+    });
+
+    expect(calls).toEqual([true, true, true]);
+  });
+
   it("bounds ordinary line matching work", () => {
     const { regex } = buildRegex("x", { mode: "basic" });
     expect(() =>

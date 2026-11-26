@@ -11,7 +11,10 @@ import {
   unsafeBytesFromLatin1,
   utf8ByteLength,
 } from "../../encoding.js";
-import type { ResourceLease } from "../../execution-scope.js";
+import {
+  createCommandCheckpoint,
+  type ResourceLease,
+} from "../../execution-scope.js";
 import { rethrowFatalExecutionError } from "../../fatal-execution-error.js";
 import { FileTraversalBudget } from "../../fs/traversal.js";
 import { shellJoinArgs } from "../../helpers/shell-quote.js";
@@ -31,6 +34,11 @@ import type { RgOptions } from "./rg-options.js";
 /**
  * Check if data is gzip compressed (magic bytes)
  */
+/** rg matches through grep's search engine, whose deadline reports as grep. */
+function createMatcherCheckpoint(ctx: RuntimeCommandContext): () => void {
+  return createCommandCheckpoint(ctx.executionScope, "grep");
+}
+
 function isGzip(data: Uint8Array): boolean {
   return data.length >= 2 && data[0] === 0x1f && data[1] === 0x8b;
 }
@@ -320,6 +328,7 @@ export async function executeSearch(
       maxWork: ctx.limits.maxLoopIterations,
       maxMatches: ctx.limits.maxArrayElements,
       signal: ctx.signal,
+      checkpoint: createMatcherCheckpoint(ctx),
     });
 
     if (options.quiet) {
@@ -1117,6 +1126,8 @@ async function searchFiles(
   collectedErrors: string,
   kResetGroup?: number,
 ): Promise<ExecResult> {
+  const matcherCheckpoint = createMatcherCheckpoint(ctx);
+  const jsonCheckpoint = createCommandCheckpoint(ctx.executionScope, "rg");
   let stdout = "";
   let anyMatch = false;
   const errors = new BoundedStringBuilder(
@@ -1189,6 +1200,7 @@ async function searchFiles(
             maxWork: ctx.limits.maxLoopIterations,
             maxMatches: ctx.limits.maxArrayElements,
             signal: ctx.signal,
+            checkpoint: matcherCheckpoint,
           });
 
           // JSON formatting below needs the source after this task ends, so
@@ -1233,6 +1245,7 @@ async function searchFiles(
           regex.lastIndex = 0;
           let lineOffset = 0;
           for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+            jsonCheckpoint();
             const line = lines[lineIdx];
             regex.lastIndex = 0;
             const submatches: JsonSubmatch[] = [];

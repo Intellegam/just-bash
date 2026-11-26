@@ -490,6 +490,24 @@ export function createCommandExecutionBudget(
   return Object.freeze(budget);
 }
 
+/**
+ * Build the per-iteration checkpoint for a command's synchronous loops. Those
+ * loops never yield to the event loop, so the dispatch deadline timer cannot
+ * fire until they finish. The first call and every 64th call check the
+ * deadline and abort signal, which keeps the per-iteration cost negligible;
+ * `force` checks now, for work that can be large on its own, such as a scan
+ * of a whole input.
+ */
+export function createCommandCheckpoint(
+  budget: CommandExecutionBudget | undefined,
+  site: string,
+): (force?: boolean) => void {
+  let calls = 0;
+  return (force = false) => {
+    if (force || (calls++ & 63) === 0) budget?.throwIfAborted(site);
+  };
+}
+
 /** Release a checked pipeline intermediate without exposing refund authority
  * through the ExecutionScope capability supplied to custom commands. */
 export function relinquishPipelineOutput(

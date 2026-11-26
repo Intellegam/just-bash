@@ -907,6 +907,7 @@ export function executeCommands(
         "iterations",
       );
     }
+    limits?.checkpoint?.();
 
     if (state.deleted || state.quit || state.quitSilent || state.restartCycle)
       break;

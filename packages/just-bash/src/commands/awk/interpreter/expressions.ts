@@ -5,7 +5,10 @@
  */
 
 import { decodeBytesToUtf8, unsafeBytesFromLatin1 } from "../../../encoding.js";
-import { ExecutionLimitError } from "../../../interpreter/errors.js";
+import {
+  ExecutionAbortedError,
+  ExecutionLimitError,
+} from "../../../interpreter/errors.js";
 import { createUserRegex } from "../../../regex/index.js";
 import {
   assertDefenseContext,
@@ -381,6 +384,7 @@ async function callUserFunction(
   args: AwkExpr[],
 ): Promise<AwkValue> {
   assertAwkDefenseContext(ctx, "user function call");
+  ctx.checkpoint();
   // Check recursion depth limit
   ctx.currentRecursionDepth++;
   if (ctx.currentRecursionDepth > ctx.maxRecursionDepth) {
@@ -661,6 +665,8 @@ async function evalGetline(
   command?: AwkExpr,
 ): Promise<AwkValue> {
   assertAwkDefenseContext(ctx, "getline evaluation");
+  // Each getline reads input, so a run of them outside any loop must stop too.
+  ctx.checkpoint(true);
   // "cmd" | getline - read from command pipe
   if (command) {
     return evalGetlineFromCommand(ctx, variable, command);
@@ -739,7 +745,10 @@ async function evalGetlineFromCommand(
       stream = { lines, index: -1 };
       ctx.getlineCommandStreams.set(cmd, stream);
     } catch (e) {
-      if (e instanceof SecurityViolationError) {
+      if (
+        e instanceof SecurityViolationError ||
+        e instanceof ExecutionAbortedError
+      ) {
         throw e;
       }
       return -1; // Error running command
@@ -811,7 +820,10 @@ async function evalGetlineFromFile(
       stream = { lines, index: -1 };
       ctx.getlineFileStreams.set(filePath, stream);
     } catch (e) {
-      if (e instanceof SecurityViolationError) {
+      if (
+        e instanceof SecurityViolationError ||
+        e instanceof ExecutionAbortedError
+      ) {
         throw e;
       }
       return -1; // Error reading file

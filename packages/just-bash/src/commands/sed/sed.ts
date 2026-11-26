@@ -1,6 +1,10 @@
 import { decodeBytesToUtf8 } from "../../encoding.js";
+import { createCommandCheckpoint } from "../../execution-scope.js";
 import { sanitizeErrorMessage } from "../../fs/sanitize-error.js";
-import { ExecutionLimitError } from "../../interpreter/errors.js";
+import {
+  ExecutionAbortedError,
+  ExecutionLimitError,
+} from "../../interpreter/errors.js";
 import type { ExecutionLimits } from "../../limits.js";
 import {
   assertDefenseContext,
@@ -78,6 +82,7 @@ interface ProcessContentOptions {
   cwd?: string;
   coverage?: FeatureCoverageWriter;
   requireDefenseContext?: boolean;
+  checkpoint?: () => void;
 }
 
 async function processContent(
@@ -86,8 +91,15 @@ async function processContent(
   silent: boolean,
   options: ProcessContentOptions = {},
 ): Promise<{ output: string; exitCode?: number; errorMessage?: string }> {
-  const { limits, filename, fs, cwd, coverage, requireDefenseContext } =
-    options;
+  const {
+    limits,
+    filename,
+    fs,
+    cwd,
+    coverage,
+    requireDefenseContext,
+    checkpoint,
+  } = options;
   assertDefenseContext(requireDefenseContext, "sed", "processing entry");
   const withDefenseContext = <T>(
     phase: string,
@@ -137,6 +149,7 @@ async function processContent(
     ? {
         maxIterations: limits.maxSedIterations,
         maxStringLength: maxOutputSize,
+        checkpoint,
       }
     : undefined;
 
@@ -164,6 +177,7 @@ async function processContent(
     // Reset lines consumed counter for this cycle
     state.linesConsumedInCycle = 0;
     do {
+      checkpoint?.();
       cycleIterations++;
       if (cycleIterations > maxCycleIterations) {
         // Prevent infinite loops
@@ -207,7 +221,10 @@ async function processContent(
               }
             }
           } catch (e) {
-            if (e instanceof SecurityViolationError) {
+            if (
+              e instanceof SecurityViolationError ||
+              e instanceof ExecutionAbortedError
+            ) {
               throw e;
             }
             // File not found - silently ignore (matches GNU sed behavior)
@@ -319,7 +336,10 @@ async function processContent(
           fs.writeFile(filePath, fileContent),
         );
       } catch (e) {
-        if (e instanceof SecurityViolationError) {
+        if (
+          e instanceof SecurityViolationError ||
+          e instanceof ExecutionAbortedError
+        ) {
           throw e;
         }
         // Write error - silently ignore for now
@@ -356,6 +376,7 @@ export const sedCommand: RuntimeCommand = {
     if (hasHelpFlag(args)) {
       return showHelp(sedHelp);
     }
+    const checkpoint = createCommandCheckpoint(ctx.executionScope, "sed");
 
     const scripts: string[] = [];
     const scriptFiles: string[] = [];
@@ -440,7 +461,10 @@ export const sedCommand: RuntimeCommand = {
           }
         }
       } catch (e) {
-        if (e instanceof SecurityViolationError) {
+        if (
+          e instanceof SecurityViolationError ||
+          e instanceof ExecutionAbortedError
+        ) {
           throw e;
         }
         return {
@@ -507,6 +531,7 @@ export const sedCommand: RuntimeCommand = {
               cwd: ctx.cwd,
               coverage: ctx.coverage,
               requireDefenseContext: ctx.requireDefenseContext,
+              checkpoint,
             }),
           );
           if (result.errorMessage) {
@@ -520,7 +545,10 @@ export const sedCommand: RuntimeCommand = {
             ctx.fs.writeFile(filePath, result.output),
           );
         } catch (e) {
-          if (e instanceof SecurityViolationError) {
+          if (
+            e instanceof SecurityViolationError ||
+            e instanceof ExecutionAbortedError
+          ) {
             throw e;
           }
           if (e instanceof ExecutionLimitError) {
@@ -556,6 +584,7 @@ export const sedCommand: RuntimeCommand = {
             cwd: ctx.cwd,
             coverage: ctx.coverage,
             requireDefenseContext: ctx.requireDefenseContext,
+            checkpoint,
           }),
         );
         // sed emits text; the pipeline handles encoding.
@@ -600,7 +629,10 @@ export const sedCommand: RuntimeCommand = {
             ctx.fs.readFile(filePath),
           );
         } catch (e) {
-          if (e instanceof SecurityViolationError) {
+          if (
+            e instanceof SecurityViolationError ||
+            e instanceof ExecutionAbortedError
+          ) {
             throw e;
           }
           if (e instanceof ExecutionLimitError) {
@@ -639,6 +671,7 @@ export const sedCommand: RuntimeCommand = {
           cwd: ctx.cwd,
           coverage: ctx.coverage,
           requireDefenseContext: ctx.requireDefenseContext,
+          checkpoint,
         }),
       );
       return {

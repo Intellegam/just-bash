@@ -109,6 +109,9 @@ export interface AwkRuntimeContext {
 
   // Defense context invariant flag propagated from RuntimeCommandContext
   requireDefenseContext?: boolean;
+
+  /** Throws once the execution deadline or abort signal is reached. */
+  checkpoint: (force?: boolean) => void;
 }
 
 export interface CreateContextOptions {
@@ -124,6 +127,7 @@ export interface CreateContextOptions {
   ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
   coverage?: FeatureCoverageWriter;
   requireDefenseContext?: boolean;
+  checkpoint?: (force?: boolean) => void;
 }
 
 export function createRuntimeContext(
@@ -140,6 +144,7 @@ export function createRuntimeContext(
     exec,
     coverage,
     requireDefenseContext,
+    checkpoint = () => {},
   } = options;
 
   return {
@@ -203,5 +208,6 @@ export function createRuntimeContext(
     exec,
     coverage,
     requireDefenseContext,
+    checkpoint,
   };
 }

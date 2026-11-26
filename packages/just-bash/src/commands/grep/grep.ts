@@ -1,4 +1,5 @@
 import { decodeBytesToUtf8 } from "../../encoding.js";
+import { createCommandCheckpoint } from "../../execution-scope.js";
 import { rethrowFatalExecutionError } from "../../fatal-execution-error.js";
 import { ExecutionLimitError } from "../../interpreter/errors.js";
 import type { UserRegex } from "../../regex/index.js";
@@ -492,6 +493,8 @@ export const grepCommand: RuntimeCommand = {
       };
     }
 
+    const checkpoint = createCommandCheckpoint(ctx.executionScope, "grep");
+
     // If no files and stdin is provided (including empty string), read from
     // stdin. grep runs regex over text — decode bytes to UTF-8 so multibyte
     // codepoints match `.` / character classes correctly.
@@ -512,6 +515,7 @@ export const grepCommand: RuntimeCommand = {
         maxWork: getMatcherWorkLimit(ctx),
         maxMatches: ctx.limits.maxArrayElements,
         signal: ctx.signal,
+        checkpoint,
       });
       if (quietMode) {
         return { stdout: "", stderr: "", exitCode: result.matched ? 0 : 1 };
@@ -707,7 +711,12 @@ export const grepCommand: RuntimeCommand = {
               const haystack = preFilter.ignoreCase
                 ? content.toLowerCase()
                 : content;
-              if (!preFilter.needles.some((n) => haystack.includes(n))) {
+              // Each needle scans the whole file.
+              const found = preFilter.needles.some((n) => {
+                checkpoint(true);
+                return haystack.includes(n);
+              });
+              if (!found) {
                 if (countOnly) {
                   const countStr = showFilename ? `${file}:0` : "0";
                   return {
@@ -741,6 +750,7 @@ export const grepCommand: RuntimeCommand = {
               maxWork: getMatcherWorkLimit(ctx),
               maxMatches: ctx.limits.maxArrayElements,
               signal: ctx.signal,
+              checkpoint,
             });
 
             return { file, result };

@@ -16,10 +16,15 @@ import type { PreFilter } from "./regex.js";
  * For case-insensitive filters, the line is lowercased once per call. Both the
  * needles and the line are compared in lowercase.
  */
-function preFilterMatches(preFilter: PreFilter, line: string): boolean {
+function preFilterMatches(
+  preFilter: PreFilter,
+  line: string,
+  wholeInputCheckpoint?: (force: boolean) => void,
+): boolean {
   const haystack = preFilter.ignoreCase ? line.toLowerCase() : line;
   const needles = preFilter.needles;
   for (let i = 0; i < needles.length; i++) {
+    wholeInputCheckpoint?.(true);
     if (haystack.indexOf(needles[i]) !== -1) return true;
   }
   return false;
@@ -95,6 +100,8 @@ export interface SearchOptions {
   maxMatches?: number;
   /** Cooperative cancellation signal checked during long scans. */
   signal?: AbortSignal;
+  /** Deadline and abort checkpoint, called once per work unit. */
+  checkpoint?: (force?: boolean) => void;
 }
 
 export interface SearchResult {
@@ -145,6 +152,7 @@ export function searchContent(
     maxWork,
     maxMatches,
     signal,
+    checkpoint,
   } = options;
 
   // Multiline mode: search entire content as one string
@@ -168,12 +176,14 @@ export function searchContent(
       maxWork,
       maxMatches,
       signal,
+      checkpoint,
     });
   }
 
   let work = 0;
   const chargeWork = (amount = 1): void => {
     if (signal?.aborted) throw new ExecutionAbortedError();
+    checkpoint?.();
     work += amount;
     if (maxWork !== undefined && work > maxWork) {
       throw new ExecutionLimitError(
@@ -537,6 +547,7 @@ function searchContentMultiline(
     maxWork?: number;
     maxMatches?: number;
     signal?: AbortSignal;
+    checkpoint?: (force?: boolean) => void;
   },
 ): SearchResult {
   const {
@@ -558,11 +569,13 @@ function searchContentMultiline(
     maxWork,
     maxMatches,
     signal,
+    checkpoint,
   } = options;
 
   let work = 0;
   const chargeWork = (amount = 1): void => {
     if (signal?.aborted) throw new ExecutionAbortedError();
+    checkpoint?.();
     work += amount;
     if (maxWork !== undefined && work > maxWork) {
       throw new ExecutionLimitError(
@@ -574,7 +587,11 @@ function searchContentMultiline(
 
   // File-level preFilter: if no needle appears anywhere in the content, no line can match.
   // Only safe when not inverting — an invert-match scan must check every line.
-  if (preFilter && !invertMatch && !preFilterMatches(preFilter, content)) {
+  if (
+    preFilter &&
+    !invertMatch &&
+    !preFilterMatches(preFilter, content, checkpoint)
+  ) {
     if (countOnly || countMatches) {
       const countStr = filename ? `${filename}:0` : "0";
       return { output: `${countStr}\n`, matched: false, matchCount: 0 };
