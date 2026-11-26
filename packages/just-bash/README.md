@@ -488,6 +488,9 @@ out. Tool implementations should forward it to network requests and other
 cancelable work so effects do not outlive the sandbox execution: an aborted
 run returns without waiting for the tool, and its late reply is discarded.
 Time spent waiting on a tool does not count against `maxJsTimeoutMs`.
+A script with tools keeps one `run` worker free for scripts without them; when
+none is free it exits 1 without running and `javascript.onWorkerRefused` is
+called.
 
 With `javascript.pause` (a `run` continuation codec plus `onInterrupted`),
 `tools.*` return Promises and a tool can call `call.interrupt(payload)`, the

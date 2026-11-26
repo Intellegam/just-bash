@@ -189,6 +189,14 @@ export interface JavaScriptConfig {
    */
   invokeTool?: InvokeTool;
   pause?: JavaScriptPauseConfig;
+  /**
+   * Called, in the trusted host context, when `run` refused a js-exec run for
+   * want of a free worker; no guest code ran and js-exec exits 1. With
+   * `invokeTool` set, js-exec keeps one worker free for scripts without tools,
+   * so a tool-using script can be refused while others still run.
+   * Exceptions propagate to `exec()`.
+   */
+  onWorkerRefused?: () => void;
 }
 
 export interface BashOptions {
@@ -582,6 +590,7 @@ export class Bash {
     if (options.javascript || jsConfig.invokeTool) {
       const jsExecHost: JsExecHost = {
         pause: jsConfig.pause,
+        onWorkerRefused: jsConfig.onWorkerRefused,
         resumeUsed: false,
       };
       for (const cmd of createJavaScriptCommands(jsExecHost)) {

@@ -6,6 +6,7 @@ import {
   getHostFunctionContext,
   RunAbortedError,
   RunBridgeLimitError,
+  RunConcurrencyError,
   RunCpuTimeoutError,
   RunError,
   type RunInterruption,
@@ -103,6 +104,8 @@ const TOOL_ARGUMENTS_ERROR: HostResult<string> = {
   error: "Tool path and arguments must be strings",
   ok: false,
 };
+const WORKER_REFUSED_MESSAGE =
+  "js-exec: no JavaScript worker is free; the script did not run\n";
 
 /** What js-exec stores in the continuation it hands to `onInterrupted`. */
 interface PauseEnvelope {
@@ -114,7 +117,9 @@ interface PauseEnvelope {
   token: string;
 }
 
-interface PauseState {
+/** What js-exec hands to the host callbacks once the run released its lane. */
+interface RunHandoff {
+  workerRefused: boolean;
   resume?: PauseEnvelope;
   /** Set once run asked the codec to decode the resume's continuation. */
   decodeStarted: boolean;
@@ -919,7 +924,7 @@ async function executeWithRunInner(
   abortSignal: AbortSignal | undefined,
   deadline: WallDeadline,
   deadlineSignal: AbortSignal,
-  pauseState: PauseState,
+  handoff: RunHandoff,
 ): Promise<ExecResult> {
   // run requires its synchronous bridge buffer to fit within the configured
   // memory limit (maxJsMemoryBytes), passes the full limit to QuickJS, and
@@ -944,9 +949,9 @@ async function executeWithRunInner(
   );
   const pause = ctx.jsExecHost?.pause;
   let continuationFailure: string | undefined;
-  const hostNamespace = pauseState.resume?.hostName ?? createHostNamespace();
+  const hostNamespace = handoff.resume?.hostName ?? createHostNamespace();
   const bootstrapModuleSpecifier =
-    pauseState.resume?.bootstrapId ??
+    handoff.resume?.bootstrapId ??
     `just-bash:bootstrap:${createOpaqueSuffix()}`;
   // With pause, run aborts with the whole interrupted result, continuation
   // included, as the reason; host callbacks get a signal with a fixed reason.
@@ -974,7 +979,7 @@ async function executeWithRunInner(
   // A resume replays the bootstrap's recorded bootstrapDone() without
   // calling it, so the bootstrap phase is already over.
   let bootstrapActive =
-    pauseState.resume === undefined &&
+    handoff.resume === undefined &&
     options.bootstrapCode !== undefined &&
     options.bootstrapCode !== "";
   const maxOutputSize = ctx.limits.maxOutputSize;
@@ -1329,7 +1334,7 @@ async function executeWithRunInner(
         : {
             continuationCodec: guardContinuationCodec(pause.continuationCodec, {
               onDecode: () => {
-                pauseState.decodeStarted = true;
+                handoff.decodeStarted = true;
               },
               onFailure: (error) => {
                 continuationFailure ??= continuationFailureDiagnostic(error);
@@ -1550,10 +1555,10 @@ ${bootstrap}
                   bootstrap: bootstrapModuleSource,
                 },
               }),
-          ...(pauseState.resume === undefined || pause?.resume === undefined
+          ...(handoff.resume === undefined || pause?.resume === undefined
             ? {}
             : {
-                continuation: pauseState.resume.token,
+                continuation: handoff.resume.token,
                 resolutions: pause.resume.resolutions,
               }),
           abortSignal,
@@ -1577,6 +1582,9 @@ ${bootstrap}
             timeoutMs: runTimeoutMs,
             cpuTimeoutMs: runCpuTimeoutMs,
           },
+          // Keeps a worker free for scripts without tools, which a script
+          // waiting on a tool (or its worker still exiting) must not starve.
+          reserveWorkers: ctx.invokeTool === undefined ? 0 : 1,
           moduleLoader,
           source,
           sourceType: options.isModule ? "module" : "function-body",
@@ -1601,7 +1609,12 @@ ${bootstrap}
       error,
       runMemoryLimitBytes,
     );
-    if (requestedExitCode !== undefined) {
+    if (error instanceof RunConcurrencyError) {
+      // Refused before any guest code ran; the text is fixed.
+      handoff.workerRefused = true;
+      output.exitCode = 1;
+      appendDiagnostic(WORKER_REFUSED_MESSAGE);
+    } else if (requestedExitCode !== undefined) {
       output.exitCode = requestedExitCode;
     } else if (bridgeBufferBytes !== undefined) {
       output.exitCode = 1;
@@ -1677,7 +1690,7 @@ ${bootstrap}
       appendDiagnostic(
         `js-exec: paused for approval of ${runResult.interruptions.length} tool call(s)\n`,
       );
-      pauseState.interrupted = {
+      handoff.interrupted = {
         interruptions: runResult.interruptions.map(toJavaScriptInterruption),
         continuation,
       };
@@ -1716,7 +1729,8 @@ export async function executeWithRun(
   }
   const host = ctx.jsExecHost;
   const pause = host?.pause;
-  const pauseState: PauseState = {
+  const handoff: RunHandoff = {
+    workerRefused: false,
     resume: undefined,
     decodeStarted: false,
     interrupted: undefined,
@@ -1731,11 +1745,11 @@ export async function executeWithRun(
     }
     host.resumeUsed = true;
     const { continuation, resolutions } = pause.resume;
-    pauseState.resume =
+    handoff.resume =
       typeof continuation === "string" && Array.isArray(resolutions)
         ? parsePauseEnvelope(continuation)
         : undefined;
-    if (pauseState.resume === undefined) {
+    if (handoff.resume === undefined) {
       return diagnosticResult(
         "js-exec: Continuation is invalid.\n",
         1,
@@ -1747,8 +1761,8 @@ export async function executeWithRun(
   const releaseResume = () => {
     if (
       host !== undefined &&
-      pauseState.resume !== undefined &&
-      !pauseState.decodeStarted
+      handoff.resume !== undefined &&
+      !handoff.decodeStarted
     ) {
       host.resumeUsed = false;
     }
@@ -1782,12 +1796,17 @@ export async function executeWithRun(
           combinedAbort.signal,
           deadline,
           timeoutController.signal,
-          pauseState,
+          handoff,
         ),
       combinedAbort.signal,
       ctx.limits.maxJsLanes,
     );
-    const { interrupted } = pauseState;
+    if (handoff.workerRefused) releaseResume();
+    const onWorkerRefused = host?.onWorkerRefused;
+    if (handoff.workerRefused && onWorkerRefused !== undefined) {
+      DefenseInDepthBox.runTrusted(() => onWorkerRefused());
+    }
+    const { interrupted } = handoff;
     if (pause !== undefined && interrupted !== undefined) {
       try {
         await DefenseInDepthBox.runTrustedAsync(
