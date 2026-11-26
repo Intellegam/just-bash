@@ -115,8 +115,20 @@ export interface ExecutionLimits {
   /** Maximum Python execution time in milliseconds (normal default: 30000) */
   maxPythonTimeoutMs?: number;
 
-  /** Maximum JavaScript execution time in milliseconds (normal default: 30000) */
+  /**
+   * Maximum guest JavaScript time per js-exec run in milliseconds (normal
+   * default: 30000). Waits on tools, the filesystem, commands, fetch and module
+   * loads do not count. Without `javascript.invokeTool` it also bounds the
+   * run's wall time, including time queued for a lane.
+   */
   maxJsTimeoutMs?: number;
+
+  /**
+   * Maximum js-exec runs active at once across the Bash instances that share
+   * this module copy (default: 1, at most 32). run rejects runs beyond its own
+   * worker cap, so keep this under it or raise it with run's setMaxWorkers.
+   */
+  maxJsLanes?: number;
 
   /** Maximum JavaScript host-bridge operations (normal default: 1000000) */
   maxJsBridgeRequests?: number;
@@ -167,6 +179,7 @@ export const DEFAULT_MAX_SOURCE_BYTES: number = 64 * 1024 * 1024;
  * profile for tighter untrusted-workload policy.
  */
 const MAX_JS_MEMORY_BYTES = 2_147_483_647;
+const MAX_JS_LANES = 32;
 
 const DEFAULT_LIMITS: Required<ExecutionLimits> = {
   maxSourceBytes: DEFAULT_MAX_SOURCE_BYTES,
@@ -213,6 +226,7 @@ const DEFAULT_LIMITS: Required<ExecutionLimits> = {
   maxJsTimeoutMs: 30000,
   maxJsBridgeRequests: 1_000_000,
   maxJsMemoryBytes: 64 * 1024 * 1024,
+  maxJsLanes: 1,
   maxGlobOperations: 1000000,
   maxStringLength: 64 * 1024 * 1024,
   maxArrayElements: 1000000,
@@ -342,6 +356,7 @@ export function resolveLimits(
     maxJsBridgeRequests:
       userLimits.maxJsBridgeRequests ?? defaults.maxJsBridgeRequests,
     maxJsMemoryBytes: userLimits.maxJsMemoryBytes ?? defaults.maxJsMemoryBytes,
+    maxJsLanes: userLimits.maxJsLanes ?? defaults.maxJsLanes,
     maxGlobOperations:
       userLimits.maxGlobOperations ?? defaults.maxGlobOperations,
     maxStringLength: userLimits.maxStringLength ?? defaults.maxStringLength,
@@ -364,6 +379,15 @@ export function resolveLimits(
   ) {
     throw new RangeError(
       `maxJsMemoryBytes must be a positive safe integer at most ${MAX_JS_MEMORY_BYTES}`,
+    );
+  }
+  if (
+    !Number.isSafeInteger(resolved.maxJsLanes) ||
+    resolved.maxJsLanes < 1 ||
+    resolved.maxJsLanes > MAX_JS_LANES
+  ) {
+    throw new RangeError(
+      `maxJsLanes must be an integer from 1 to ${MAX_JS_LANES}`,
     );
   }
   for (const key of Object.keys(resolved) as (keyof ExecutionLimits)[]) {

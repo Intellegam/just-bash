@@ -5,6 +5,7 @@ import {
   getHostFunctionContext,
   RunAbortedError,
   RunBridgeLimitError,
+  RunCpuTimeoutError,
   RunError,
   type RunModuleLoader,
   RunTimeoutError,
@@ -65,12 +66,13 @@ interface GuestSourceLocation {
 
 const jsExecContext = new AsyncLocalStorage<boolean>();
 interface QueuedExecution {
-  canceled: boolean;
+  lanes: number;
   start(): void;
 }
 
+// One FIFO per module copy, shared by every Bash instance.
 const executionQueue: QueuedExecution[] = [];
-let executionActive = false;
+let activeExecutions = 0;
 const RUN_SYNC_BRIDGE_PAYLOAD_BYTES = 8 * 1024 * 1024;
 const RUN_MAX_LIMIT_VALUE = 2_147_483_647;
 const RUN_BRIDGE_VALUE_OVERHEAD_BYTES = 4096;
@@ -630,26 +632,29 @@ const guestSetupSource = (
 })();
 `;
 
+// The head starts while fewer runs are active than its own instance's
+// maxJsLanes; later entries wait behind it.
 const processNextExecution = (): void => {
-  if (executionActive) return;
-  const next = executionQueue.shift();
-  if (next === undefined) return;
-  if (next.canceled) {
-    processNextExecution();
-    return;
+  for (
+    let next = executionQueue[0];
+    next !== undefined && activeExecutions < next.lanes;
+    next = executionQueue[0]
+  ) {
+    executionQueue.shift();
+    activeExecutions += 1;
+    next.start();
   }
-  executionActive = true;
-  next.start();
 };
 
 const enqueue = <T>(
   operation: () => Promise<T>,
   signal: AbortSignal | undefined,
+  lanes: number,
 ): Promise<T> => {
   const boundOperation = DefenseInDepthBox.bindCurrentContext(operation);
   return new Promise<T>((resolve, reject) => {
     const queued: QueuedExecution = {
-      canceled: false,
+      lanes,
       start() {
         signal?.removeEventListener("abort", cancel);
         void (async () => {
@@ -658,7 +663,7 @@ const enqueue = <T>(
           } catch (error) {
             reject(error);
           } finally {
-            executionActive = false;
+            activeExecutions -= 1;
             processNextExecution();
           }
         })();
@@ -668,9 +673,9 @@ const enqueue = <T>(
       const index = executionQueue.indexOf(queued);
       if (index === -1) return;
       executionQueue.splice(index, 1);
-      queued.canceled = true;
       signal?.removeEventListener("abort", cancel);
       reject(new JsExecQueueCanceledError());
+      processNextExecution();
     };
     signal?.addEventListener("abort", cancel, { once: true });
     executionQueue.push(queued);
@@ -706,11 +711,33 @@ const diagnosticResult = (
   stdout: "",
 });
 
+interface WallDeadline {
+  limitMs: number;
+  remainingMs(): number;
+  clear(): void;
+}
+
+// Defense-in-depth blocks performance.now() outside trusted code, and fetch
+// reads the remainder from inside a host call.
+const startWallDeadline = (
+  limitMs: number,
+  onExpire: () => void,
+): WallDeadline => {
+  const now = () => DefenseInDepthBox.runTrusted(() => performance.now());
+  const end = now() + limitMs;
+  const timer = _setTimeoutIfFinite(onExpire, limitMs);
+  return {
+    limitMs,
+    remainingMs: () => Math.ceil(Math.max(0, end - now())),
+    clear: () => _clearFiniteTimeout(timer),
+  };
+};
+
 async function executeWithRunInner(
   options: RunJsOptions,
   ctx: RuntimeCommandContext,
   abortSignal: AbortSignal | undefined,
-  deadline: number,
+  deadline: WallDeadline,
   deadlineSignal: AbortSignal,
 ): Promise<ExecResult> {
   // run requires its synchronous bridge buffer to fit within the configured
@@ -809,6 +836,7 @@ async function executeWithRunInner(
   const attempt = async <T>(
     operation: () => Promise<T>,
     sanitize = sanitizeErrorMessage,
+    settle = true,
   ): Promise<HostResult<T>> => {
     if (requestedExitCode !== undefined) {
       return { error: "process.exit() already requested", ok: false };
@@ -819,7 +847,7 @@ async function executeWithRunInner(
     let pending: Promise<T> | undefined;
     try {
       pending = DefenseInDepthBox.runUntrustedAsync(operation);
-      pendingOperations.add(pending);
+      if (settle) pendingOperations.add(pending);
       return { ok: true, value: await pending };
     } catch (error) {
       return { ok: false, error: sanitize(getErrorMessage(error)) };
@@ -978,15 +1006,14 @@ async function executeWithRunInner(
                 throw new Error(
                   "Network access not configured. Enable network in Bash options.",
                 );
-              const remaining =
-                deadline === Number.POSITIVE_INFINITY
-                  ? undefined
-                  : Math.max(0, deadline - Date.now());
+              const remaining = deadline.remainingMs();
               const response = await ctx.fetch(url, {
                 method: init?.method,
                 headers: init?.headers,
                 body: init?.body,
-                ...(remaining === undefined ? {} : { timeoutMs: remaining }),
+                ...(remaining === Number.POSITIVE_INFINITY
+                  ? {}
+                  : { timeoutMs: remaining }),
                 signal: getHostFunctionContext().abortSignal,
               });
               return {
@@ -1037,19 +1064,26 @@ async function executeWithRunInner(
               return projectExecResult(result);
             });
           },
+          // Not settled with filesystem operations: an aborted run releases
+          // its lane at once and run discards the tool's late reply.
           async invokeTool(path: string, argsJson: string) {
-            return await attempt(async () => {
-              if (!ctx.invokeTool) throw new Error(`Unknown tool: ${path}`);
-              const { abortSignal } = getHostFunctionContext();
-              return await DefenseInDepthBox.runTrustedAsync(
-                () =>
-                  ctx.invokeTool?.(
-                    path,
-                    argsJson,
-                    abortSignal,
-                  ) as Promise<string>,
-              );
-            }, sanitizeHostErrorMessage);
+            return await attempt(
+              async () => {
+                if (!ctx.invokeTool) throw new Error(`Unknown tool: ${path}`);
+                const { abortSignal } = getHostFunctionContext();
+                if (abortSignal.aborted) throw new Error("Execution timeout");
+                return await DefenseInDepthBox.runTrustedAsync(
+                  () =>
+                    ctx.invokeTool?.(
+                      path,
+                      argsJson,
+                      abortSignal,
+                    ) as Promise<string>,
+                );
+              },
+              sanitizeHostErrorMessage,
+              false,
+            );
           },
         },
       },
@@ -1189,12 +1223,16 @@ ${bootstrap}
         : 0,
     ),
   );
-  // run currently requires a finite 32-bit timeout. Preserve Infinity as
-  // its longest practical value (~24.9 days).
-  const runTimeoutMs =
-    deadline === Number.POSITIVE_INFINITY
-      ? RUN_MAX_LIMIT_VALUE
-      : Math.min(Math.max(1, deadline - Date.now()), RUN_MAX_LIMIT_VALUE);
+  // run currently requires finite 32-bit timeouts. Preserve Infinity as
+  // their longest practical value (~24.9 days).
+  const runTimeoutMs = Math.min(
+    Math.max(1, deadline.remainingMs()),
+    RUN_MAX_LIMIT_VALUE,
+  );
+  const runCpuTimeoutMs = Math.min(
+    Math.max(1, ctx.limits.maxJsTimeoutMs),
+    RUN_MAX_LIMIT_VALUE,
+  );
   const runMemoryLimitBytes = ctx.limits.maxJsMemoryBytes;
 
   try {
@@ -1221,6 +1259,7 @@ ${bootstrap}
             maxSourceBytes: maxRunSourceBytes,
             memoryLimitBytes: runMemoryLimitBytes,
             timeoutMs: runTimeoutMs,
+            cpuTimeoutMs: runCpuTimeoutMs,
           },
           moduleLoader,
           source,
@@ -1261,13 +1300,18 @@ ${bootstrap}
       appendDiagnostic(
         `js-exec: bootstrap error: ${bootstrapFailure ?? sanitizeErrorMessage(message)}\n`,
       );
+    } else if (error instanceof RunCpuTimeoutError) {
+      output.exitCode = 124;
+      appendDiagnostic(
+        `js-exec: Execution timeout: exceeded ${ctx.limits.maxJsTimeoutMs}ms limit\n`,
+      );
     } else if (
       error instanceof RunTimeoutError ||
       error instanceof RunAbortedError
     ) {
       output.exitCode = 124;
       appendDiagnostic(
-        `js-exec: ${error instanceof RunTimeoutError || deadlineSignal.aborted ? `Execution timeout: exceeded ${ctx.limits.maxJsTimeoutMs}ms limit` : "Execution aborted"}\n`,
+        `js-exec: ${error instanceof RunTimeoutError || deadlineSignal.aborted ? `Execution timeout: exceeded ${deadline.limitMs}ms limit` : "Execution aborted"}\n`,
       );
     } else {
       output.exitCode = 1;
@@ -1326,13 +1370,20 @@ export async function executeWithRun(
     };
   }
   const timeoutController = new AbortController();
-  const deadline =
-    ctx.limits.maxJsTimeoutMs === Number.POSITIVE_INFINITY
-      ? Number.POSITIVE_INFINITY
-      : Date.now() + ctx.limits.maxJsTimeoutMs;
-  const timeout = _setTimeoutIfFinite(
+  // maxJsTimeoutMs bounds guest time only (run's cpuTimeoutMs). The wall
+  // deadline, from enqueue, is the shell's remaining time: the shell returns
+  // at its deadline without cancelling js-exec, which would otherwise keep
+  // its lane and worker. Tool calls can wait on people or services, so only
+  // without tools does maxJsTimeoutMs bound wall time too.
+  const shellRemainingMs = Math.max(
+    1,
+    ctx.executionScope?.remainingTimeMs() ?? ctx.limits.maxExecutionTimeMs,
+  );
+  const deadline = startWallDeadline(
+    ctx.invokeTool !== undefined
+      ? shellRemainingMs
+      : Math.min(ctx.limits.maxJsTimeoutMs, shellRemainingMs),
     () => timeoutController.abort(),
-    ctx.limits.maxJsTimeoutMs,
   );
   const combinedAbort = combineAbortSignals(
     ctx.signal,
@@ -1349,17 +1400,18 @@ export async function executeWithRun(
           timeoutController.signal,
         ),
       combinedAbort.signal,
+      ctx.limits.maxJsLanes,
     );
   } catch (error) {
     if (!(error instanceof JsExecQueueCanceledError)) throw error;
     const timedOut = timeoutController.signal.aborted;
     return diagnosticResult(
-      `js-exec: ${timedOut ? `Execution timeout: exceeded ${ctx.limits.maxJsTimeoutMs}ms limit` : "Execution aborted"}\n`,
+      `js-exec: ${timedOut ? `Execution timeout: exceeded ${deadline.limitMs}ms limit` : "Execution aborted"}\n`,
       124,
       ctx.limits.maxOutputSize,
     );
   } finally {
     combinedAbort.cleanup();
-    _clearFiniteTimeout(timeout);
+    deadline.clear();
   }
 }

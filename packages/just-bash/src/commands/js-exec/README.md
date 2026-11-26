@@ -255,6 +255,7 @@ and/or `@executor-js/sdk` discovery (GraphQL, OpenAPI, MCP).
 ## Limits
 
 - **Memory**: 64 MiB QuickJS heap per execution (configurable via `maxJsMemoryBytes`, a positive integer up to 2,147,483,647; other values throw a `RangeError` when the `Bash` instance is created). A value smaller than the host bridge buffer, just over 8 MiB by default, fails every run before any guest code starts
-- **Timeout**: 30 seconds normally and 10 seconds in the hardened profile; never raised by enabling network access (configurable via `maxJsTimeoutMs`, including time spent waiting for another `js-exec` invocation; `Infinity` maps to about 24.9 days)
+- **Timeout**: `maxJsTimeoutMs` (30 seconds normally, 10 seconds in the hardened profile; `Infinity` maps to about 24.9 days) bounds guest JavaScript time; waits on tools, the filesystem, commands, fetch and module loads do not count. Wall time from the moment the run is queued is bounded by the shell's remaining `maxExecutionTimeMs` and, unless `invokeTool` is configured, by `maxJsTimeoutMs` too; a tool call that never settles ends at the shell deadline. Enabling network access never raises either
+- **Concurrency**: `maxJsLanes` (default 1, at most 32) runs at once across all `Bash` instances that share one copy of the module; later runs queue. `run` rejects runs beyond its worker cap ("maxWorkers limit reached"), so keep lanes under it or raise it with `run`'s `setMaxWorkers`
 - **Host bridge operations**: 8 MiB per-call payload ceiling, bounded by `maxJsBridgeRequests` (100,000 in the hardened profile and 1,000,000 otherwise)
 - **Engine**: QuickJS (compiled to WebAssembly)

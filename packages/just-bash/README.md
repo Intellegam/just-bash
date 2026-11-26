@@ -485,7 +485,9 @@ await bash.exec(`js-exec -c 'console.log((await tools.math.add({a:3,b:4})).sum)'
 
 The `abortSignal` fires when the JavaScript execution is canceled or times
 out. Tool implementations should forward it to network requests and other
-cancelable work so effects do not outlive the sandbox execution.
+cancelable work so effects do not outlive the sandbox execution: an aborted
+run returns without waiting for the tool, and its late reply is discarded.
+Time spent waiting on a tool does not count against `maxJsTimeoutMs`.
 
 The hook is generic — wire any tool framework through it (raw maps, MCP,
 Anthropic tool-use, etc.). For full GraphQL / OpenAPI / MCP discovery via
