@@ -98,6 +98,8 @@ const createHostNamespace = (): string => `__jbHost_${createOpaqueSuffix()}`;
 const asyncHostGroup = (hostNamespace: string): string =>
   `${hostNamespace}_async`;
 const PAUSED_EXIT_CODE = 75;
+const PAUSE_NOT_CONFIGURED_MESSAGE =
+  "This script cannot pause for approval: javascript.pause is not configured.";
 const CONTINUATION_FAILED_MESSAGE =
   "js-exec: Continuation could not be stored or read.\n";
 const TOOL_ARGUMENTS_ERROR: HostResult<string> = {
@@ -948,24 +950,28 @@ async function executeWithRunInner(
     ),
   );
   const pause = ctx.jsExecHost?.pause;
+  // pause implies asynchronous tools; asyncTools alone has no ledger and no
+  // interrupt.
+  const asyncTools = pause !== undefined || ctx.jsExecHost?.asyncTools === true;
   let continuationFailure: string | undefined;
   const hostNamespace = handoff.resume?.hostName ?? createHostNamespace();
   const bootstrapModuleSpecifier =
     handoff.resume?.bootstrapId ??
     `just-bash:bootstrap:${createOpaqueSuffix()}`;
-  // With pause, run aborts with the whole interrupted result, continuation
-  // included, as the reason; host callbacks get a signal with a fixed reason.
-  let pauseSafeSignal: AbortSignal | undefined;
+  // With asynchronous tools, run aborts a pending call with the guest's error
+  // or the whole interrupted result, continuation included, as the reason;
+  // host callbacks get a signal with a fixed reason.
+  let safeSignal: AbortSignal | undefined;
   const hostSignal = (signal: AbortSignal): AbortSignal => {
-    if (pause === undefined) return signal;
-    if (pauseSafeSignal === undefined) {
+    if (!asyncTools) return signal;
+    if (safeSignal === undefined) {
       const controller = new AbortController();
       const abort = () => controller.abort(new Error("js-exec run ended"));
       if (signal.aborted) abort();
       else signal.addEventListener("abort", abort, { once: true });
-      pauseSafeSignal = controller.signal;
+      safeSignal = controller.signal;
     }
-    return pauseSafeSignal;
+    return safeSignal;
   };
   let runResult: RunResult<unknown, string> | undefined;
   const output: OutputState = {
@@ -1304,8 +1310,8 @@ async function executeWithRunInner(
               return projectExecResult(result);
             });
           },
-          // With pause, tools go through the asynchronous group instead.
-          ...(pause !== undefined
+          // Asynchronous tools go through their own group instead.
+          ...(asyncTools
             ? {}
             : {
                 async invokeTool(path: unknown, argsJson: unknown) {
@@ -1320,9 +1326,7 @@ async function executeWithRunInner(
                   return await callTool(path, argsJson, abortSignal, {
                     requestIndex,
                     interrupt() {
-                      throw new Error(
-                        "This script cannot pause for approval: javascript.pause is not configured.",
-                      );
+                      throw new Error(PAUSE_NOT_CONFIGURED_MESSAGE);
                     },
                   });
                 },
@@ -1346,57 +1350,59 @@ async function executeWithRunInner(
           }),
     }),
   );
-  const pauseHostFunctions =
-    pause === undefined
-      ? undefined
-      : {
-          [asyncHostGroup(hostNamespace)]: {
-            async invokeTool(path: unknown, argsJson: unknown) {
-              const host = getHostFunctionContext();
-              if (typeof path !== "string" || typeof argsJson !== "string") {
-                return TOOL_ARGUMENTS_ERROR;
-              }
-              // run's interrupt must leave the host function itself, not be
-              // turned into a tool error by attempt().
-              let interruption: { payload: unknown } | undefined;
-              const interrupted = new Error("interrupted");
-              const result = await callTool(
-                path,
-                argsJson,
-                host.abortSignal,
-                {
-                  requestIndex: host.requestIndex,
-                  ...(host.resume === undefined
-                    ? {}
-                    : {
-                        resume: {
-                          interruptionId: host.resume.interruptionId,
-                          resolution: host.resume.resolution,
-                        },
-                      }),
-                  interrupt(payload: unknown): never {
-                    interruption = { payload };
-                    throw interrupted;
-                  },
+  const asyncToolHostFunctions = !asyncTools
+    ? undefined
+    : {
+        [asyncHostGroup(hostNamespace)]: {
+          async invokeTool(path: unknown, argsJson: unknown) {
+            const host = getHostFunctionContext();
+            if (typeof path !== "string" || typeof argsJson !== "string") {
+              return TOOL_ARGUMENTS_ERROR;
+            }
+            // run's interrupt must leave the host function itself, not be
+            // turned into a tool error by attempt().
+            let interruption: { payload: unknown } | undefined;
+            const interrupted = new Error("interrupted");
+            const result = await callTool(
+              path,
+              argsJson,
+              host.abortSignal,
+              {
+                requestIndex: host.requestIndex,
+                ...(host.resume === undefined
+                  ? {}
+                  : {
+                      resume: {
+                        interruptionId: host.resume.interruptionId,
+                        resolution: host.resume.resolution,
+                      },
+                    }),
+                interrupt(payload: unknown): never {
+                  if (pause === undefined) {
+                    throw new Error(PAUSE_NOT_CONFIGURED_MESSAGE);
+                  }
+                  interruption = { payload };
+                  throw interrupted;
                 },
-                interrupted,
-              );
-              if (interruption !== undefined) {
-                host.interrupt({
-                  requestIndex: host.requestIndex,
-                  payload: interruption.payload,
-                } satisfies ToolInterruptPayload);
-              }
-              return result;
-            },
+              },
+              interrupted,
+            );
+            if (interruption !== undefined) {
+              host.interrupt({
+                requestIndex: host.requestIndex,
+                payload: interruption.payload,
+              } satisfies ToolInterruptPayload);
+            }
+            return result;
           },
-        };
+        },
+      };
 
   const setup = guestSetupSource(
     serializedEnv,
     serializedArgv,
     serializedCwd,
-    ctx.invokeTool === undefined ? "none" : pause ? "async" : "sync",
+    ctx.invokeTool === undefined ? "none" : asyncTools ? "async" : "sync",
     hostNamespace,
   );
   const bootstrap = options.bootstrapCode ?? "";
@@ -1542,10 +1548,12 @@ ${bootstrap}
       let runPromise!: ReturnType<typeof runner.run>;
       DefenseInDepthBox.runTrusted(() => {
         runPromise = runner.run({
+          ...(asyncToolHostFunctions === undefined
+            ? {}
+            : { hostFunctions: asyncToolHostFunctions }),
           ...(pause === undefined
             ? {}
             : {
-                hostFunctions: pauseHostFunctions,
                 // .mjs scripts load the bootstrap (env, argv, cwd, prelude) as
                 // a module whose recorded source would otherwise replay
                 // unchecked on resume.

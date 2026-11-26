@@ -170,7 +170,8 @@ export interface JavaScriptConfig {
   /**
    * Tool invocation hook. When provided, code running in `js-exec` gets a
    * global `tools` proxy that routes calls through this callback: synchronously
-   * while `run` dispatches the host binding, or as Promises with `pause`.
+   * while `run` dispatches the host binding, or as Promises with `pause` or
+   * `asyncTools`.
    *
    * - `path`: dot-separated tool path (e.g. `"math.add"`). The proxy builds
    *   it from JS property access — `tools.math.add(...)` becomes `"math.add"`.
@@ -189,6 +190,13 @@ export interface JavaScriptConfig {
    */
   invokeTool?: InvokeTool;
   pause?: JavaScriptPauseConfig;
+  /**
+   * Makes `tools.*` return Promises without `pause`: `run` keeps no
+   * continuation ledger while `RUN_CONTINUATION_SECRET` is unset in the
+   * process environment, and `call.interrupt` throws. `pause` wins when both
+   * are set.
+   */
+  asyncTools?: boolean;
   /**
    * Called, in the trusted host context, when `run` refused a js-exec run for
    * want of a free worker; no guest code ran and js-exec exits 1. With
@@ -590,6 +598,7 @@ export class Bash {
     if (options.javascript || jsConfig.invokeTool) {
       const jsExecHost: JsExecHost = {
         pause: jsConfig.pause,
+        asyncTools: jsConfig.asyncTools === true,
         onWorkerRefused: jsConfig.onWorkerRefused,
         resumeUsed: false,
       };

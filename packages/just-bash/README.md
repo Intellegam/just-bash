@@ -499,7 +499,10 @@ hook's fourth argument, to pause the script, for example for approval.
 continuation. A later `Bash` with `pause.resume` set to that continuation and
 the resolutions runs the script again: recorded results replay, and the paused
 call runs with `call.resume.resolution`. Without `pause`, `interrupt` throws
-inside the script. Exit 75 is an ordinary status, so run a pausable script as a
+inside the script. `javascript.asyncTools: true` gives the Promise-returning
+`tools.*` without pausing: no continuation codec is needed and, while
+`RUN_CONTINUATION_SECRET` is unset, `run` records no replay ledger, so bridge
+replies do not count against its continuation size limit. Exit 75 is an ordinary status, so run a pausable script as a
 single top-level `js-exec`, and tell scripts to `await` tool calls.
 
 The hook is generic — wire any tool framework through it (raw maps, MCP,

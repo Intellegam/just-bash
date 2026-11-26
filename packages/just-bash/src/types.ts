@@ -300,6 +300,7 @@ export interface RuntimeCommandContext {
  */
 export interface JsExecHost {
   pause?: JavaScriptPauseConfig;
+  asyncTools: boolean;
   onWorkerRefused?: () => void;
   /** A `pause.resume` runs at most once per Bash instance. */
   resumeUsed: boolean;
