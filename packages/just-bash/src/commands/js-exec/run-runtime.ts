@@ -803,6 +803,9 @@ async function executeWithRunInner(
     return { ok: true, value: undefined };
   };
   const resolve = (path: string) => ctx.fs.resolvePath(ctx.cwd, path);
+  // run can settle (timeout, abort) while a host operation still runs; the
+  // result waits for these so no filesystem change lands after js-exec returns.
+  const pendingOperations = new Set<Promise<unknown>>();
   const attempt = async <T>(
     operation: () => Promise<T>,
     sanitize = sanitizeErrorMessage,
@@ -813,13 +816,15 @@ async function executeWithRunInner(
     if (!consumeBridgeRequest()) {
       return { error: bridgeLimitMessage, ok: false };
     }
+    let pending: Promise<T> | undefined;
     try {
-      return {
-        ok: true,
-        value: await DefenseInDepthBox.runUntrustedAsync(operation),
-      };
+      pending = DefenseInDepthBox.runUntrustedAsync(operation);
+      pendingOperations.add(pending);
+      return { ok: true, value: await pending };
     } catch (error) {
       return { ok: false, error: sanitize(getErrorMessage(error)) };
+    } finally {
+      if (pending !== undefined) pendingOperations.delete(pending);
     }
   };
   const toFileData = (data: unknown): string | Uint8Array => {
@@ -1126,26 +1131,30 @@ ${bootstrap}
           `Cannot find module '${name}': not found. Run 'js-exec --help' for available modules.`,
         )});`;
       }
+      const read = DefenseInDepthBox.runUntrustedAsync(async () => {
+        const stat = await ctx.fs.stat(specifier);
+        if (stat.size > maxModuleReadBytes) {
+          throw new Error(
+            `Module exceeds JavaScript source limit (${maxModuleReadBytes} bytes)`,
+          );
+        }
+        const moduleSource = await ctx.fs.readFile(specifier);
+        if (Buffer.byteLength(moduleSource) > maxModuleReadBytes) {
+          throw new Error(
+            `Module exceeds JavaScript source limit (${maxModuleReadBytes} bytes)`,
+          );
+        }
+        return moduleSource;
+      });
+      pendingOperations.add(read);
       try {
-        return await DefenseInDepthBox.runUntrustedAsync(async () => {
-          const stat = await ctx.fs.stat(specifier);
-          if (stat.size > maxModuleReadBytes) {
-            throw new Error(
-              `Module exceeds JavaScript source limit (${maxModuleReadBytes} bytes)`,
-            );
-          }
-          const moduleSource = await ctx.fs.readFile(specifier);
-          if (Buffer.byteLength(moduleSource) > maxModuleReadBytes) {
-            throw new Error(
-              `Module exceeds JavaScript source limit (${maxModuleReadBytes} bytes)`,
-            );
-          }
-          return moduleSource;
-        });
+        return await read;
       } catch (error) {
         return `throw new Error(${JSON.stringify(
           sanitizeErrorMessage(getErrorMessage(error)),
         )});`;
+      } finally {
+        pendingOperations.delete(read);
       }
     },
   };
@@ -1284,6 +1293,7 @@ ${bootstrap}
       );
     }
   }
+  await Promise.allSettled([...pendingOperations]);
   if (bridgeLimitExceeded) reportBridgeLimit();
   if (output.limitExceeded) {
     output.exitCode = 1;
