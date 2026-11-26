@@ -79,6 +79,10 @@ export interface AwkRuntimeContext {
 
   // Output buffer (stdout)
   output: string;
+  // UTF-8 bytes in `output` and whether it ends in an unpaired high
+  // surrogate; append through appendOutput() in statements.ts.
+  outputBytes: number;
+  outputEndsInHighSurrogate: boolean;
 
   // Filesystem access for getline < file and print > file
   fs?: AwkFileSystem;
@@ -187,6 +191,8 @@ export function createRuntimeContext(
     inEndBlock: false,
 
     output: "",
+    outputBytes: 0,
+    outputEndsInHighSurrogate: false,
     openedFiles: new Set(),
     pendingOutput: new Map(),
     pendingOutputChars: 0,

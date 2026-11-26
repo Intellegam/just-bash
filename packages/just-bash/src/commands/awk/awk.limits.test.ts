@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Bash } from "../../Bash.js";
+import * as encoding from "../../encoding.js";
 import { ExecutionLimitError } from "../../interpreter/errors.js";
 
 /**
@@ -10,6 +11,10 @@ import { ExecutionLimitError } from "../../interpreter/errors.js";
  *
  * IMPORTANT: All tests should complete quickly (<1s each).
  */
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("AWK Execution Limits", () => {
   describe("infinite loop protection", () => {
@@ -100,6 +105,71 @@ describe("AWK Execution Limits", () => {
       // Doubling 30 times would be 2^30 = 1GB, must hit string length limit
       expect(result.exitCode).toBe(ExecutionLimitError.EXIT_CODE);
       expect(result.stderr).toContain("exceeded");
+    });
+
+    // awk's output limit is min(maxStringLength, maxOutputSize). Binding it
+    // through maxStringLength keeps the shell's total-output check, which
+    // also counts the error message, out of the way. "é" is two UTF-8 bytes.
+    const printfOnly = `awk 'BEGIN { for (i = 0; i < 50; i++) printf "%s", "é" }'`;
+    const printThenPrintf = `awk 'BEGIN { for (i = 0; i < 32; i++) print "é"; printf "%s", "é" }'`;
+    // substr() splits "😀" into two lone surrogates, 3 bytes each alone and 4
+    // once joined, with an empty write between them. Each half is charged on
+    // its own before it is appended, so the last low half needs 3 bytes of
+    // room: 39 * 4 + 3 + 3 = 162.
+    const splitPairs = `awk 'BEGIN { s = "😀"; for (i = 0; i < 40; i++) { printf "%s", substr(s, 1, 1); printf ""; printf "%s", substr(s, 2, 1) } }'`;
+    const overLimit = "awk: formatted string size limit exceeded (1 bytes)\n";
+    it.each([
+      ["printf at", printfOnly, 100, "é".repeat(50), "", 0],
+      ["printf one byte under", printfOnly, 99, "é".repeat(49), overLimit, 126],
+      [
+        "print then printf at",
+        printThenPrintf,
+        98,
+        `${"é\n".repeat(32)}é`,
+        "",
+        0,
+      ],
+      [
+        "print then printf one byte under",
+        printThenPrintf,
+        97,
+        "é\n".repeat(32),
+        overLimit,
+        126,
+      ],
+      ["split surrogate pairs at", splitPairs, 162, "😀".repeat(40), "", 0],
+    ])("counts %s the byte limit in UTF-8 bytes", async (_case, script, limit, stdout, stderr, exitCode) => {
+      const env = new Bash({ executionLimits: { maxStringLength: limit } });
+      const result = await env.exec(script);
+      expect(result.stdout).toBe(stdout);
+      expect(result.stderr).toBe(stderr);
+      expect(result.exitCode).toBe(exitCode);
+    });
+
+    it("keeps the UTF-16 code units passed to utf8ByteLength linear in printf calls", async () => {
+      const codeUnitsMeasured = async (count: number): Promise<number> => {
+        const env = new Bash();
+        const spy = vi.spyOn(encoding, "utf8ByteLength");
+        const result = await env.exec(
+          `awk 'BEGIN { for (i = 0; i < ${count}; i++) printf "%d\\n", i }'`,
+        );
+        const measured = spy.mock.calls.reduce(
+          (total, [value]) => total + value.length,
+          0,
+        );
+        spy.mockRestore();
+        const expected = Array.from({ length: count }, (_, i) => `${i}\n`);
+        expect(result.stdout).toBe(expected.join(""));
+        expect(result.stderr).toBe("");
+        expect(result.exitCode).toBe(0);
+        return measured;
+      };
+      const single = await codeUnitsMeasured(1000);
+      const double = await codeUnitsMeasured(2000);
+      // Twice the printf calls is about twice the output, so measuring each
+      // call's text about doubles the work and re-measuring all earlier
+      // output per call about quadruples it.
+      expect(double).toBeLessThan(3 * single);
     });
   });
 

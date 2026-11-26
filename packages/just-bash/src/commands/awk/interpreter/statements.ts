@@ -35,6 +35,22 @@ function checkAwkOutputSize(ctx: AwkRuntimeContext): void {
   }
 }
 
+function appendOutput(ctx: AwkRuntimeContext, text: string): void {
+  if (text === "") return;
+  let bytes = utf8ByteLength(text);
+  // Two halves of one character written separately count 3 bytes each on
+  // their own and 4 together once joined.
+  const first = text.charCodeAt(0);
+  if (ctx.outputEndsInHighSurrogate && first >= 0xdc00 && first <= 0xdfff) {
+    bytes -= 2;
+  }
+  const last = text.charCodeAt(text.length - 1);
+  ctx.outputEndsInHighSurrogate = last >= 0xd800 && last <= 0xdbff;
+  ctx.output += text;
+  ctx.outputBytes += bytes;
+  checkAwkOutputSize(ctx);
+}
+
 function assertAwkDefenseContext(ctx: AwkRuntimeContext, phase: string): void {
   assertDefenseContext(ctx.requireDefenseContext, "awk", phase);
 }
@@ -231,8 +247,7 @@ async function executePrint(
       writeToFile(ctx, output.redirect, output.file, text),
     );
   } else {
-    ctx.output += text;
-    checkAwkOutputSize(ctx);
+    appendOutput(ctx, text);
   }
 }
 
@@ -262,7 +277,7 @@ async function executePrintf(
   // DEBUG: console.log("printf DEBUG:", JSON.stringify({formatStr, values}));
   const remainingOutput =
     ctx.maxOutputSize > 0
-      ? Math.max(0, ctx.maxOutputSize - utf8ByteLength(ctx.output))
+      ? Math.max(0, ctx.maxOutputSize - ctx.outputBytes)
       : undefined;
   const text = formatPrintf(formatStr, values, remainingOutput);
 
@@ -271,8 +286,7 @@ async function executePrintf(
       writeToFile(ctx, output.redirect, output.file, text),
     );
   } else {
-    ctx.output += text;
-    checkAwkOutputSize(ctx);
+    appendOutput(ctx, text);
   }
 }
 
@@ -289,8 +303,7 @@ async function writeToFile(
   const fs = ctx.fs;
   if (!fs || !ctx.cwd) {
     // No filesystem access - just append to output
-    ctx.output += text;
-    checkAwkOutputSize(ctx);
+    appendOutput(ctx, text);
     return;
   }
 
