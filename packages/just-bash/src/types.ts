@@ -336,6 +336,12 @@ export interface Command {
 export interface RuntimeCommand extends Omit<Command, "execute"> {
   /** @internal Bundled command shadowed by this host extension. */
   internalOriginalCommand?: RuntimeCommand;
+  /**
+   * @internal When cancelled while it uses tools, the shell waits past the
+   * cleanup window for this command to settle, because it still holds a
+   * resource other commands need (js-exec: a run worker) until then.
+   */
+  internalHoldsWorkerAfterCancel?: boolean;
   execute(args: string[], ctx: RuntimeCommandContext): Promise<ExecResult>;
 }
 export type CommandRegistry = Map<string, RuntimeCommand>;

@@ -642,6 +642,9 @@ export class Bash {
       trusted,
       internalIsExtension: isExtension,
       internalOriginalCommand: originalCommand,
+      internalHoldsWorkerAfterCancel:
+        !isExtension &&
+        (command as RuntimeCommand).internalHoldsWorkerAfterCancel === true,
       execute: (args, context) => command.execute(args, context),
     };
     this.commands.set(command.name, runtimeCommand);

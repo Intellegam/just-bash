@@ -15,6 +15,7 @@ type CommandLoader = () => Promise<RuntimeCommand>;
 interface LazyCommandDef<T extends string = string> {
   name: T;
   load: CommandLoader;
+  holdsWorkerAfterCancel?: boolean;
 }
 
 /** All available built-in command names (excludes network commands) */
@@ -531,6 +532,7 @@ if (typeof __BROWSER__ === "undefined" || !__BROWSER__) {
   jsCommandLoaders.push({
     name: "js-exec",
     load: async () => (await import("./js-exec/js-exec.js")).jsExecCommand,
+    holdsWorkerAfterCancel: true,
   });
   jsCommandLoaders.push({
     name: "node",
@@ -555,6 +557,7 @@ const cache = new Map<string, RuntimeCommand>();
 function createLazyCommand(def: LazyCommandDef): RuntimeCommand {
   return {
     name: def.name,
+    internalHoldsWorkerAfterCancel: def.holdsWorkerAfterCancel === true,
     async execute(
       args: string[],
       ctx: RuntimeCommandContext,

@@ -351,6 +351,7 @@ async function runWithExecutionDeadline(
   commandName: string,
   rawScope: ExecutionScope,
   rawSignal: AbortSignal | undefined,
+  awaitSettlementAfterCancel: boolean,
 ): Promise<ExecResult> {
   const remainingMs =
     rawScope.remainingTimeMs() ?? context.limits.maxExecutionTimeMs;
@@ -389,12 +390,20 @@ async function runWithExecutionDeadline(
     // grace period is only for the extension promise to settle; it must not
     // be an extra window for filesystem, descriptor, or budget mutation.
     revoke();
-    const acknowledged = await Promise.race([
+    let acknowledged = await Promise.race([
       settled.then(() => true),
       new Promise<false>((resolve) => {
         graceTimer = _setTimeoutIfFinite(() => resolve(false), graceMs);
       }),
     ]);
+    if (!acknowledged && awaitSettlementAfterCancel) {
+      // js-exec aborts its run on this cancellation, and run frees the worker
+      // only once the worker has terminated (Bun: at most 100 ms). js-exec
+      // then waits only for filesystem calls already in flight. Returning
+      // earlier would leave the worker counted against run's cap after exec().
+      await settled;
+      acknowledged = true;
+    }
     const error =
       outcome.kind === "deadline"
         ? new ExecutionAbortedError(
@@ -1015,6 +1024,8 @@ export async function executeExternalCommand(
         commandName,
         ctx.executionScope,
         ctx.state.signal,
+        (cmd as RuntimeCommand).internalHoldsWorkerAfterCancel === true &&
+          ctx.invokeTool !== undefined,
       );
 
     const commandResult = cmd.trusted

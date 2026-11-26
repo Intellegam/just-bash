@@ -1,3 +1,4 @@
+import { Worker } from "node:worker_threads";
 import {
   type ContinuationCodec,
   createSignedContinuationCodec,
@@ -12,6 +13,7 @@ import {
   type JavaScriptPauseConfig,
 } from "../../Bash.js";
 import type { ExecutionLimits } from "../../limits.js";
+import { _setTimeout } from "../../timers.js";
 
 const REFUSED =
   "js-exec: no JavaScript worker is free; the script did not run\n";
@@ -64,8 +66,34 @@ function codeMode(
   return { bash, refusals: () => refusals };
 }
 
-describe("js-exec worker reserve", () => {
-  beforeAll(() => setMaxWorkers(2));
+/** Delays every worker termination, as a slow thread exit would. */
+function slowWorkerExit(ms: number): () => void {
+  const terminate = Worker.prototype.terminate;
+  Worker.prototype.terminate = function (this: Worker) {
+    return new Promise<number>((resolve, reject) => {
+      _setTimeout(() => terminate.call(this).then(resolve, reject), ms);
+    });
+  };
+  return () => {
+    Worker.prototype.terminate = terminate;
+  };
+}
+
+const abortOf = (signal: AbortSignal | undefined) =>
+  new Promise<void>((resolve) => {
+    if (signal === undefined || signal.aborted) resolve();
+    else signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+
+const WORKER_EXIT_MS = 1_500;
+// Long enough for the held tool call to arrive before the shell deadline.
+const SHELL_DEADLINE: ExecutionLimits = { maxExecutionTimeMs: 1_000 };
+
+describe("js-exec worker reserve", { timeout: 20_000 }, () => {
+  beforeAll(async () => {
+    setMaxWorkers(2);
+    await new Bash({ javascript: true }).exec(PLAIN);
+  });
   afterAll(() => setMaxWorkers(undefined));
 
   it("refuses a second tool-using script but still runs a script without tools", async () => {
@@ -185,5 +213,58 @@ describe("js-exec worker reserve", () => {
       });
       expect(decodes).toBe(1);
     });
+  });
+
+  it("keeps a worker free while a timed-out tool-using script's worker exits", async () => {
+    const restore = slowWorkerExit(WORKER_EXIT_MS);
+    const tools = heldTools();
+    try {
+      const timedOut = codeMode(tools.invokeTool, SHELL_DEADLINE).bash.exec(
+        HELD,
+      );
+      await tools.firstArrival;
+      await abortOf(tools.signals[0]);
+      const second = codeMode(tools.invokeTool);
+      const [secondResult, plainResult] = await Promise.all([
+        second.bash.exec(HELD),
+        new Bash({ javascript: true, executionLimits: LANES }).exec(PLAIN),
+      ]);
+      tools.release();
+
+      expect(secondResult).toMatchObject({
+        exitCode: 1,
+        stderr: REFUSED,
+        stdout: "",
+      });
+      expect(plainResult).toMatchObject({
+        exitCode: 0,
+        stderr: "",
+        stdout: "plain\n",
+      });
+      expect((await timedOut).exitCode).toBe(124);
+    } finally {
+      tools.release();
+      restore();
+    }
+  });
+
+  it("returns from a timed-out tool-using script only once its worker is free", async () => {
+    const restore = slowWorkerExit(WORKER_EXIT_MS);
+    const tools = heldTools();
+    try {
+      const timedOut = await codeMode(
+        tools.invokeTool,
+        SHELL_DEADLINE,
+      ).bash.exec(HELD);
+      const next = await codeMode(tools.invokeTool).bash.exec(
+        `js-exec -c "console.log('next')"`,
+      );
+
+      expect(timedOut.exitCode).toBe(124);
+      expect(next).toMatchObject({ exitCode: 0, stderr: "", stdout: "next\n" });
+    } finally {
+      tools.release();
+      restore();
+    }
   });
 });
