@@ -489,6 +489,16 @@ cancelable work so effects do not outlive the sandbox execution: an aborted
 run returns without waiting for the tool, and its late reply is discarded.
 Time spent waiting on a tool does not count against `maxJsTimeoutMs`.
 
+With `javascript.pause` (a `run` continuation codec plus `onInterrupted`),
+`tools.*` return Promises and a tool can call `call.interrupt(payload)`, the
+hook's fourth argument, to pause the script, for example for approval.
+`js-exec` then exits 75 and `onInterrupted` receives the interruptions and a
+continuation. A later `Bash` with `pause.resume` set to that continuation and
+the resolutions runs the script again: recorded results replay, and the paused
+call runs with `call.resume.resolution`. Without `pause`, `interrupt` throws
+inside the script. Exit 75 is an ordinary status, so run a pausable script as a
+single top-level `js-exec`, and tell scripts to `await` tool calls.
+
 The hook is generic — wire any tool framework through it (raw maps, MCP,
 Anthropic tool-use, etc.). For full GraphQL / OpenAPI / MCP discovery via
 `@executor-js/sdk`, plus auto-generated bash namespace commands, use the

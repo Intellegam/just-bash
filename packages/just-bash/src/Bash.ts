@@ -8,6 +8,7 @@
  * and delegates execution to the Interpreter.
  */
 
+import type { ContinuationCodec, RunResolution } from "run";
 import type { FunctionDefNode } from "./ast/types.js";
 // Eagerly import timers to capture references before defense-in-depth patches them
 import "./timers.js";
@@ -82,6 +83,7 @@ import type {
   Command,
   CommandRegistry,
   FeatureCoverageWriter,
+  JsExecHost,
   RuntimeCommand,
   TraceCallback,
 } from "./types.js";
@@ -112,19 +114,70 @@ export interface BashLogger {
   debug(message: string, data?: Record<string, unknown>): void;
 }
 
+/** The fourth `invokeTool` argument. */
+export interface InvokeToolCall {
+  /** run's host request index; a call keeps it across a pause and its resume. */
+  requestIndex: number;
+  /** Set when a paused call runs again on resume. */
+  resume?: { interruptionId: string; resolution: unknown };
+  /** Pauses the script at this call; throws when `pause` is not configured. */
+  interrupt(payload: unknown): never;
+}
+
+export interface JavaScriptInterruption {
+  id: string;
+  tool: string;
+  argsJson: string;
+  payload: unknown;
+  requestIndex: number;
+}
+
+/**
+ * Makes `tools.*` return Promises so a tool call can pause the script
+ * (`call.interrupt(payload)`) and a later Bash resume it. A paused js-exec
+ * exits 75; run it as a single top-level command, never inside a compound
+ * command. A resume replays recorded filesystem, command, fetch, module and
+ * tool results without running them again, so it needs the same files as at
+ * the pause.
+ */
+export interface JavaScriptPauseConfig {
+  continuationCodec: ContinuationCodec<string>;
+  continuationAudience?: string;
+  /** Serializable binding (tenant, principal) that a resume must match. */
+  continuationContext?: unknown;
+  resume?: { continuation: string; resolutions: RunResolution[] };
+  /**
+   * Receives the interruptions and the continuation after the run released
+   * its lane. `signal` aborts at the shell deadline: stage the continuation
+   * and commit it only once `exec()` returned 75.
+   */
+  onInterrupted(
+    info: { interruptions: JavaScriptInterruption[]; continuation: string },
+    options: { signal: AbortSignal },
+  ): void | Promise<void>;
+}
+
+export type InvokeTool = (
+  path: string,
+  argsJson: string,
+  abortSignal: AbortSignal,
+  call: InvokeToolCall,
+) => Promise<string>;
+
 export interface JavaScriptConfig {
   /** Bootstrap JavaScript code to run before user scripts */
   bootstrap?: string;
   /**
    * Tool invocation hook. When provided, code running in `js-exec` gets a
-   * global `tools` proxy that routes calls through this callback synchronously
-   * while `run` dispatches the host binding.
+   * global `tools` proxy that routes calls through this callback: synchronously
+   * while `run` dispatches the host binding, or as Promises with `pause`.
    *
    * - `path`: dot-separated tool path (e.g. `"math.add"`). The proxy builds
    *   it from JS property access — `tools.math.add(...)` becomes `"math.add"`.
    * - `argsJson`: JSON-stringified args object, or empty string for no args.
    * - `abortSignal`: aborts when js-exec is canceled or times out. Tool
    *   implementations should forward it to cancelable work.
+   * - `call`: run's request index and `interrupt(payload)`; see `pause`.
    * - return: JSON-stringified result, or empty string for `undefined`.
    * - throw: propagates as a catchable exception inside the sandbox.
    *
@@ -134,11 +187,8 @@ export interface JavaScriptConfig {
    * `@just-bash/executor` produces a matching `invokeTool` + `commands` pair
    * from inline tools and/or `@executor-js/sdk` discovery.
    */
-  invokeTool?: (
-    path: string,
-    argsJson: string,
-    abortSignal: AbortSignal,
-  ) => Promise<string>;
+  invokeTool?: InvokeTool;
+  pause?: JavaScriptPauseConfig;
 }
 
 export interface BashOptions {
@@ -339,11 +389,7 @@ export class Bash {
   private defenseInDepthConfig?: DefenseInDepthConfig | boolean;
   private coverageWriter?: FeatureCoverageWriter;
   private jsBootstrapCode?: string;
-  private invokeToolFn?: (
-    path: string,
-    argsJson: string,
-    abortSignal: AbortSignal,
-  ) => Promise<string>;
+  private invokeToolFn?: InvokeTool;
   // biome-ignore lint/suspicious/noExplicitAny: type-erased plugin storage for untyped API
   private transformPlugins: TransformPlugin<any>[] = [];
 
@@ -534,7 +580,11 @@ export class Bash {
     // Register javascript commands when JS is enabled or an invokeTool hook
     // is provided (the hook is meaningless without js-exec).
     if (options.javascript || jsConfig.invokeTool) {
-      for (const cmd of createJavaScriptCommands()) {
+      const jsExecHost: JsExecHost = {
+        pause: jsConfig.pause,
+        resumeUsed: false,
+      };
+      for (const cmd of createJavaScriptCommands(jsExecHost)) {
         this.registerBundledCommand(cmd);
       }
       if (jsConfig.bootstrap) {

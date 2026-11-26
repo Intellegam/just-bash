@@ -11,7 +11,11 @@ export type {
   BashLogger,
   BashOptions,
   ExecOptions,
+  InvokeTool,
+  InvokeToolCall,
   JavaScriptConfig,
+  JavaScriptInterruption,
+  JavaScriptPauseConfig,
 } from "./Bash.js";
 export { Bash } from "./Bash.js";
 export type {

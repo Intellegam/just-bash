@@ -8,6 +8,7 @@ import type {
   ScriptNode,
   StatementNode,
 } from "../ast/types.js";
+import type { InvokeTool } from "../Bash.js";
 import type { ExecutionScope } from "../execution-scope.js";
 import type { IFileSystem } from "../fs/interface.js";
 import type { ExecutionLimits } from "../limits.js";
@@ -518,9 +519,5 @@ export interface InterpreterContext {
    * Tool invoker hook. When present, js-exec sets up a `tools` proxy that
    * routes calls through this callback.
    */
-  invokeTool?: (
-    path: string,
-    argsJson: string,
-    abortSignal: AbortSignal,
-  ) => Promise<string>;
+  invokeTool?: InvokeTool;
 }

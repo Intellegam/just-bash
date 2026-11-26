@@ -5,6 +5,7 @@ import { raceCancellation } from "../abort-signals.js";
 import { DefenseInDepthBox } from "../security/defense-in-depth-box.js";
 import type {
   ExecResult,
+  JsExecHost,
   RuntimeCommand,
   RuntimeCommandContext,
 } from "../types.js";
@@ -661,8 +662,21 @@ export function getJavaScriptCommandNames(): string[] {
  * Creates javascript commands for registration (js-exec).
  * These are only registered when javascript is explicitly enabled.
  */
-export function createJavaScriptCommands(): RuntimeCommand[] {
-  return jsCommandLoaders.map(createLazyCommand);
+export function createJavaScriptCommands(host?: JsExecHost): RuntimeCommand[] {
+  return jsCommandLoaders.map((def) => {
+    const command = createLazyCommand(def);
+    if (host === undefined || def.name !== "js-exec") return command;
+    return {
+      ...command,
+      execute: (args, ctx) =>
+        command.execute(
+          args,
+          Object.create(ctx, {
+            jsExecHost: { value: host },
+          }) as RuntimeCommandContext,
+        ),
+    };
+  });
 }
 
 /**

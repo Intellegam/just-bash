@@ -1,3 +1,4 @@
+import type { InvokeTool, JavaScriptPauseConfig } from "./Bash.js";
 import type { ByteString } from "./encoding.js";
 import type { CommandExecutionBudget } from "./execution-scope.js";
 import type { IFileSystem } from "./fs/interface.js";
@@ -285,14 +286,22 @@ export interface RuntimeCommandContext {
   /**
    * Tool invoker hook. When present, js-exec sets up a `tools` proxy that
    * routes calls through this callback. Receives `(path, argsJson,
-   * abortSignal)` and returns a JSON result string. Implementations should
-   * forward the signal to cancelable work.
+   * abortSignal, call)` and returns a JSON result string. Implementations
+   * should forward the signal to cancelable work.
    */
-  invokeTool?: (
-    path: string,
-    argsJson: string,
-    abortSignal: AbortSignal,
-  ) => Promise<string>;
+  invokeTool?: InvokeTool;
+  /** @internal js-exec's own hooks; set only on js-exec's context. */
+  jsExecHost?: JsExecHost;
+}
+
+/**
+ * @internal What a Bash instance hands its js-exec alone: a pause carries a
+ * codec, a resumable continuation and a callback that no other command may use.
+ */
+export interface JsExecHost {
+  pause?: JavaScriptPauseConfig;
+  /** A `pause.resume` runs at most once per Bash instance. */
+  resumeUsed: boolean;
 }
 
 /** Legacy standalone context shape used by direct command invocations. */

@@ -1,16 +1,20 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Buffer } from "node:buffer";
 import {
+  type ContinuationCodec,
   createRunner,
   getHostFunctionContext,
   RunAbortedError,
   RunBridgeLimitError,
   RunCpuTimeoutError,
   RunError,
+  type RunInterruption,
   type RunModuleLoader,
+  type RunResult,
   RunTimeoutError,
 } from "run";
 import { combineAbortSignals } from "../../abort-signals.js";
+import type { InvokeToolCall, JavaScriptInterruption } from "../../Bash.js";
 import {
   sanitizeErrorMessage,
   sanitizeHostErrorMessage,
@@ -88,6 +92,175 @@ const createOpaqueSuffix = (): string => {
 };
 
 const createHostNamespace = (): string => `__jbHost_${createOpaqueSuffix()}`;
+// run interrupts only asynchronous host functions, so pausable tool calls get
+// their own group beside the synchronous one.
+const asyncHostGroup = (hostNamespace: string): string =>
+  `${hostNamespace}_async`;
+const PAUSED_EXIT_CODE = 75;
+const CONTINUATION_FAILED_MESSAGE =
+  "js-exec: Continuation could not be stored or read.\n";
+const TOOL_ARGUMENTS_ERROR: HostResult<string> = {
+  error: "Tool path and arguments must be strings",
+  ok: false,
+};
+
+/** What js-exec stores in the continuation it hands to `onInterrupted`. */
+interface PauseEnvelope {
+  v: 1;
+  // The random host group and bootstrap module names are part of the run's
+  // source and scope, so a resume must reuse them.
+  hostName: string;
+  bootstrapId: string;
+  token: string;
+}
+
+interface PauseState {
+  resume?: PauseEnvelope;
+  /** Set once run asked the codec to decode the resume's continuation. */
+  decodeStarted: boolean;
+  interrupted?: {
+    interruptions: JavaScriptInterruption[];
+    continuation: string;
+  };
+}
+
+// Room for run's default 32 MiB continuation state, base64-encoded and
+// signed; checked before JSON.parse.
+// @banned-pattern-ignore: parse guard sized from run's continuation limit, not a tunable resource ceiling
+const MAX_PAUSE_ENVELOPE_CHARS = 48 * 1024 * 1024;
+const PAUSE_ENVELOPE_KEYS = ["bootstrapId", "hostName", "token", "v"];
+
+const parsePauseEnvelope = (
+  continuation: string,
+): PauseEnvelope | undefined => {
+  if (continuation.length > MAX_PAUSE_ENVELOPE_CHARS) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(continuation);
+  } catch {
+    return undefined;
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    Object.keys(parsed).sort().join() !== PAUSE_ENVELOPE_KEYS.join()
+  ) {
+    return undefined;
+  }
+  const { v, hostName, bootstrapId, token } = parsed as Partial<PauseEnvelope>;
+  if (
+    v !== 1 ||
+    typeof hostName !== "string" ||
+    !/^__jbHost_[0-9a-z_]{1,64}$/.test(hostName) ||
+    typeof bootstrapId !== "string" ||
+    !/^just-bash:bootstrap:[0-9a-z_]{1,64}$/.test(bootstrapId) ||
+    typeof token !== "string" ||
+    token.length === 0
+  ) {
+    return undefined;
+  }
+  return { v, hostName, bootstrapId, token };
+};
+
+// The fixed texts run's own codecs (createSignedContinuationCodec,
+// createStoredContinuationCodec, run 2.1.13) fail with; the size limit is
+// the signed codec's default maxTokenBytes. Any other codec error text may
+// carry continuation state, so it is never shown.
+const RUN_CODEC_MESSAGES = new Set([
+  "Continuation token must be a string.",
+  "Continuation token is malformed.",
+  "Continuation payload is malformed.",
+  "Continuation signature is invalid.",
+  "Continuation envelope is invalid.",
+  "Continuation payload is not canonically encoded.",
+  "Continuation has expired.",
+  "Continuation was issued in the future.",
+  "Continuation lifetime is invalid.",
+  "Stored continuation key is invalid.",
+  "Stored continuation was not found.",
+  "Stored continuation envelope is invalid.",
+  "Stored continuation has expired.",
+  "Continuation token exceeds the 33554432 byte size limit.",
+]);
+
+const continuationFailureDiagnostic = (error: unknown): string => {
+  try {
+    if (!RunError.isInstance(error)) return CONTINUATION_FAILED_MESSAGE;
+    // Read once: an accessor could answer differently on a second read.
+    const message: unknown = error.message;
+    return typeof message === "string" && RUN_CODEC_MESSAGES.has(message)
+      ? `js-exec: ${message}\n`
+      : CONTINUATION_FAILED_MESSAGE;
+  } catch {
+    return CONTINUATION_FAILED_MESSAGE;
+  }
+};
+
+/**
+ * Wraps a continuation codec so that any failure of it or its decode
+ * transaction, whatever its class and including a throwing property read,
+ * reaches `onFailure` and surfaces to run without the codec's text.
+ */
+const guardContinuationCodec = (
+  codec: ContinuationCodec<string>,
+  hooks: { onDecode(): void; onFailure(error: unknown): void },
+): ContinuationCodec<string> => {
+  const guard = async <T>(call: () => T | Promise<T>): Promise<T> => {
+    try {
+      return await call();
+    } catch (error) {
+      hooks.onFailure(error);
+      throw new Error("Continuation codec failed.");
+    }
+  };
+  const decodeTransaction: NonNullable<
+    ContinuationCodec<string>["decodeTransaction"]
+  > = (token, context) => {
+    hooks.onDecode();
+    return guard(async () => {
+      const decodeWithin = codec.decodeTransaction;
+      if (decodeWithin === undefined) {
+        const state = await codec.decode(token, context);
+        return { state, commit: () => {}, rollback: () => {} };
+      }
+      const transaction = await decodeWithin.call(codec, token, context);
+      return {
+        state: transaction.state,
+        commit: () => guard(() => transaction.commit()),
+        rollback: () => guard(() => transaction.rollback()),
+      };
+    });
+  };
+  return {
+    encode: (state, context) => guard(() => codec.encode(state, context)),
+    decode: (token, context) => {
+      hooks.onDecode();
+      return guard(() => codec.decode(token, context));
+    },
+    decodeTransaction,
+  };
+};
+
+/** The payload js-exec's asynchronous invokeTool hands to run's interrupt. */
+interface ToolInterruptPayload {
+  requestIndex: number;
+  payload: unknown;
+}
+
+const toJavaScriptInterruption = (
+  interruption: RunInterruption,
+): JavaScriptInterruption => {
+  const { payload, requestIndex } =
+    interruption.payload as ToolInterruptPayload;
+  return {
+    id: interruption.id,
+    tool: String(interruption.arguments[0]),
+    argsJson: String(interruption.arguments[1] ?? ""),
+    payload,
+    requestIndex,
+  };
+};
 
 class JsExecQueueCanceledError extends Error {}
 
@@ -466,7 +639,7 @@ const guestSetupSource = (
   serializedEnv: string,
   serializedArgv: string,
   serializedCwd: string,
-  hasInvokeTool: boolean,
+  tools: "none" | "sync" | "async",
   hostNamespace: string,
 ): string => `
 (function() {
@@ -613,7 +786,7 @@ const guestSetupSource = (
   console.warn = console.error;
 
   ${
-    hasInvokeTool
+    tools !== "none"
       ? `globalThis.tools = (function makeProxy(path) {
     return new Proxy(function(){}, {
       get: function(_target, property) {
@@ -622,8 +795,15 @@ const guestSetupSource = (
       },
       apply: function(_target, _this, args) {
         var argsJson = args.length ? JSON.stringify(args[0]) : '';
-        var value = unwrap(host.invokeTool(path.join('.'), argsJson || ''));
-        return value ? JSON.parse(value) : undefined;
+        ${
+          tools === "async"
+            ? `return globalThis[${JSON.stringify(asyncHostGroup(hostNamespace))}].invokeTool(path.join('.'), argsJson || '').then(function(result) {
+          var value = unwrap(result);
+          return value ? JSON.parse(value) : undefined;
+        });`
+            : `var value = unwrap(host.invokeTool(path.join('.'), argsJson || ''));
+        return value ? JSON.parse(value) : undefined;`
+        }
       }
     });
   })([]);`
@@ -739,6 +919,7 @@ async function executeWithRunInner(
   abortSignal: AbortSignal | undefined,
   deadline: WallDeadline,
   deadlineSignal: AbortSignal,
+  pauseState: PauseState,
 ): Promise<ExecResult> {
   // run requires its synchronous bridge buffer to fit within the configured
   // memory limit (maxJsMemoryBytes), passes the full limit to QuickJS, and
@@ -761,8 +942,27 @@ async function executeWithRunInner(
       RUN_MAX_LIMIT_VALUE,
     ),
   );
-  const hostNamespace = createHostNamespace();
-  const bootstrapModuleSpecifier = `just-bash:bootstrap:${createOpaqueSuffix()}`;
+  const pause = ctx.jsExecHost?.pause;
+  let continuationFailure: string | undefined;
+  const hostNamespace = pauseState.resume?.hostName ?? createHostNamespace();
+  const bootstrapModuleSpecifier =
+    pauseState.resume?.bootstrapId ??
+    `just-bash:bootstrap:${createOpaqueSuffix()}`;
+  // With pause, run aborts with the whole interrupted result, continuation
+  // included, as the reason; host callbacks get a signal with a fixed reason.
+  let pauseSafeSignal: AbortSignal | undefined;
+  const hostSignal = (signal: AbortSignal): AbortSignal => {
+    if (pause === undefined) return signal;
+    if (pauseSafeSignal === undefined) {
+      const controller = new AbortController();
+      const abort = () => controller.abort(new Error("js-exec run ended"));
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+      pauseSafeSignal = controller.signal;
+    }
+    return pauseSafeSignal;
+  };
+  let runResult: RunResult<unknown, string> | undefined;
   const output: OutputState = {
     exitCode: 0,
     limitExceeded: false,
@@ -771,8 +971,12 @@ async function executeWithRunInner(
   };
   let requestedExitCode: number | undefined;
   let bootstrapFailure: string | undefined;
+  // A resume replays the bootstrap's recorded bootstrapDone() without
+  // calling it, so the bootstrap phase is already over.
   let bootstrapActive =
-    options.bootstrapCode !== undefined && options.bootstrapCode !== "";
+    pauseState.resume === undefined &&
+    options.bootstrapCode !== undefined &&
+    options.bootstrapCode !== "";
   const maxOutputSize = ctx.limits.maxOutputSize;
   let outputBytes = 0;
   let bridgeRequests = 0;
@@ -867,6 +1071,37 @@ async function executeWithRunInner(
     }
     return Uint8Array.from(data);
   };
+  // Not settled with filesystem operations: an aborted run releases its lane
+  // at once and run discards the tool's late reply.
+  const callTool = (
+    path: string,
+    argsJson: string,
+    abortSignal: AbortSignal,
+    call: InvokeToolCall,
+    interrupted?: Error,
+  ) =>
+    attempt(
+      async () => {
+        if (!ctx.invokeTool) throw new Error(`Unknown tool: ${path}`);
+        if (abortSignal.aborted) throw new Error("Execution timeout");
+        try {
+          return await DefenseInDepthBox.runTrustedAsync(
+            () =>
+              ctx.invokeTool?.(
+                path,
+                argsJson,
+                hostSignal(abortSignal),
+                call,
+              ) as Promise<string>,
+          );
+        } catch (error) {
+          if (interrupted !== undefined && error === interrupted) return "";
+          throw error;
+        }
+      },
+      sanitizeHostErrorMessage,
+      false,
+    );
   const env = mapToRecord(ctx.env);
   const argv = [options.scriptPath, ...options.scriptArgs];
   const maxGuestInputBytes = Math.min(
@@ -1014,7 +1249,7 @@ async function executeWithRunInner(
                 ...(remaining === Number.POSITIVE_INFINITY
                   ? {}
                   : { timeoutMs: remaining }),
-                signal: getHostFunctionContext().abortSignal,
+                signal: hostSignal(getHostFunctionContext().abortSignal),
               });
               return {
                 body: Buffer.from(response.body).toString("latin1"),
@@ -1034,7 +1269,7 @@ async function executeWithRunInner(
               const execOptions: CommandExecOptions = {
                 cwd: ctx.cwd,
                 env,
-                signal: getHostFunctionContext().abortSignal,
+                signal: hostSignal(getHostFunctionContext().abortSignal),
                 stdin: stdin ?? "",
               };
               const result = await jsExecContext.run(
@@ -1058,43 +1293,105 @@ async function executeWithRunInner(
                     args: args.map(String),
                     cwd: ctx.cwd,
                     env,
-                    signal: getHostFunctionContext().abortSignal,
+                    signal: hostSignal(getHostFunctionContext().abortSignal),
                   }) as Promise<ExecResult>,
               );
               return projectExecResult(result);
             });
           },
-          // Not settled with filesystem operations: an aborted run releases
-          // its lane at once and run discards the tool's late reply.
-          async invokeTool(path: string, argsJson: string) {
-            return await attempt(
-              async () => {
-                if (!ctx.invokeTool) throw new Error(`Unknown tool: ${path}`);
-                const { abortSignal } = getHostFunctionContext();
-                if (abortSignal.aborted) throw new Error("Execution timeout");
-                return await DefenseInDepthBox.runTrustedAsync(
-                  () =>
-                    ctx.invokeTool?.(
-                      path,
-                      argsJson,
-                      abortSignal,
-                    ) as Promise<string>,
-                );
-              },
-              sanitizeHostErrorMessage,
-              false,
-            );
-          },
+          // With pause, tools go through the asynchronous group instead.
+          ...(pause !== undefined
+            ? {}
+            : {
+                async invokeTool(path: unknown, argsJson: unknown) {
+                  const { abortSignal, requestIndex } =
+                    getHostFunctionContext();
+                  if (
+                    typeof path !== "string" ||
+                    typeof argsJson !== "string"
+                  ) {
+                    return TOOL_ARGUMENTS_ERROR;
+                  }
+                  return await callTool(path, argsJson, abortSignal, {
+                    requestIndex,
+                    interrupt() {
+                      throw new Error(
+                        "This script cannot pause for approval: javascript.pause is not configured.",
+                      );
+                    },
+                  });
+                },
+              }),
         },
       },
+      ...(pause === undefined
+        ? {}
+        : {
+            continuationCodec: guardContinuationCodec(pause.continuationCodec, {
+              onDecode: () => {
+                pauseState.decodeStarted = true;
+              },
+              onFailure: (error) => {
+                continuationFailure ??= continuationFailureDiagnostic(error);
+              },
+            }),
+            ...(pause.continuationAudience === undefined
+              ? {}
+              : { continuationAudience: pause.continuationAudience }),
+          }),
     }),
   );
+  const pauseHostFunctions =
+    pause === undefined
+      ? undefined
+      : {
+          [asyncHostGroup(hostNamespace)]: {
+            async invokeTool(path: unknown, argsJson: unknown) {
+              const host = getHostFunctionContext();
+              if (typeof path !== "string" || typeof argsJson !== "string") {
+                return TOOL_ARGUMENTS_ERROR;
+              }
+              // run's interrupt must leave the host function itself, not be
+              // turned into a tool error by attempt().
+              let interruption: { payload: unknown } | undefined;
+              const interrupted = new Error("interrupted");
+              const result = await callTool(
+                path,
+                argsJson,
+                host.abortSignal,
+                {
+                  requestIndex: host.requestIndex,
+                  ...(host.resume === undefined
+                    ? {}
+                    : {
+                        resume: {
+                          interruptionId: host.resume.interruptionId,
+                          resolution: host.resume.resolution,
+                        },
+                      }),
+                  interrupt(payload: unknown): never {
+                    interruption = { payload };
+                    throw interrupted;
+                  },
+                },
+                interrupted,
+              );
+              if (interruption !== undefined) {
+                host.interrupt({
+                  requestIndex: host.requestIndex,
+                  payload: interruption.payload,
+                } satisfies ToolInterruptPayload);
+              }
+              return result;
+            },
+          },
+        };
 
   const setup = guestSetupSource(
     serializedEnv,
     serializedArgv,
     serializedCwd,
-    ctx.invokeTool !== undefined,
+    ctx.invokeTool === undefined ? "none" : pause ? "async" : "sync",
     hostNamespace,
   );
   const bootstrap = options.bootstrapCode ?? "";
@@ -1240,6 +1537,25 @@ ${bootstrap}
       let runPromise!: ReturnType<typeof runner.run>;
       DefenseInDepthBox.runTrusted(() => {
         runPromise = runner.run({
+          ...(pause === undefined
+            ? {}
+            : {
+                hostFunctions: pauseHostFunctions,
+                // .mjs scripts load the bootstrap (env, argv, cwd, prelude) as
+                // a module whose recorded source would otherwise replay
+                // unchecked on resume.
+                continuationContext: {
+                  host: pause.continuationContext ?? null,
+                  bootstrapId: bootstrapModuleSpecifier,
+                  bootstrap: bootstrapModuleSource,
+                },
+              }),
+          ...(pauseState.resume === undefined || pause?.resume === undefined
+            ? {}
+            : {
+                continuation: pauseState.resume.token,
+                resolutions: pause.resume.resolutions,
+              }),
           abortSignal,
           limits: {
             maxBridgeRequests: Math.min(
@@ -1266,7 +1582,7 @@ ${bootstrap}
           sourceType: options.isModule ? "module" : "function-body",
         });
       });
-      await runPromise;
+      runResult = await runPromise;
     });
   } catch (error) {
     const message = getErrorMessage(error);
@@ -1313,6 +1629,9 @@ ${bootstrap}
       appendDiagnostic(
         `js-exec: ${error instanceof RunTimeoutError || deadlineSignal.aborted ? `Execution timeout: exceeded ${deadline.limitMs}ms limit` : "Execution aborted"}\n`,
       );
+    } else if (continuationFailure !== undefined) {
+      output.exitCode = 1;
+      appendDiagnostic(continuationFailure);
     } else {
       output.exitCode = 1;
       const isGuestError =
@@ -1338,6 +1657,32 @@ ${bootstrap}
     }
   }
   await Promise.allSettled([...pendingOperations]);
+  if (
+    runResult?.status === "interrupted" &&
+    !output.limitExceeded &&
+    !bridgeLimitExceeded
+  ) {
+    const continuation = JSON.stringify({
+      v: 1,
+      hostName: hostNamespace,
+      bootstrapId: bootstrapModuleSpecifier,
+      token: runResult.continuation,
+    } satisfies PauseEnvelope);
+    // Hand off only a continuation that a resume would accept.
+    if (parsePauseEnvelope(continuation) === undefined) {
+      output.exitCode = 1;
+      appendDiagnostic(CONTINUATION_FAILED_MESSAGE);
+    } else {
+      output.exitCode = PAUSED_EXIT_CODE;
+      appendDiagnostic(
+        `js-exec: paused for approval of ${runResult.interruptions.length} tool call(s)\n`,
+      );
+      pauseState.interrupted = {
+        interruptions: runResult.interruptions.map(toJavaScriptInterruption),
+        continuation,
+      };
+    }
+  }
   if (bridgeLimitExceeded) reportBridgeLimit();
   if (output.limitExceeded) {
     output.exitCode = 1;
@@ -1369,6 +1714,45 @@ export async function executeWithRun(
       stdout: "",
     };
   }
+  const host = ctx.jsExecHost;
+  const pause = host?.pause;
+  const pauseState: PauseState = {
+    resume: undefined,
+    decodeStarted: false,
+    interrupted: undefined,
+  };
+  if (host !== undefined && pause?.resume !== undefined) {
+    if (host.resumeUsed) {
+      return diagnosticResult(
+        "js-exec: Continuation was already used.\n",
+        1,
+        ctx.limits.maxOutputSize,
+      );
+    }
+    host.resumeUsed = true;
+    const { continuation, resolutions } = pause.resume;
+    pauseState.resume =
+      typeof continuation === "string" && Array.isArray(resolutions)
+        ? parsePauseEnvelope(continuation)
+        : undefined;
+    if (pauseState.resume === undefined) {
+      return diagnosticResult(
+        "js-exec: Continuation is invalid.\n",
+        1,
+        ctx.limits.maxOutputSize,
+      );
+    }
+  }
+  // A resume whose continuation was never decoded stays usable.
+  const releaseResume = () => {
+    if (
+      host !== undefined &&
+      pauseState.resume !== undefined &&
+      !pauseState.decodeStarted
+    ) {
+      host.resumeUsed = false;
+    }
+  };
   const timeoutController = new AbortController();
   // maxJsTimeoutMs bounds guest time only (run's cpuTimeoutMs). The wall
   // deadline, from enqueue, is the shell's remaining time: the shell returns
@@ -1390,7 +1774,7 @@ export async function executeWithRun(
     timeoutController.signal,
   );
   try {
-    return await enqueue(
+    const result = await enqueue(
       async () =>
         await executeWithRunInner(
           options,
@@ -1398,12 +1782,34 @@ export async function executeWithRun(
           combinedAbort.signal,
           deadline,
           timeoutController.signal,
+          pauseState,
         ),
       combinedAbort.signal,
       ctx.limits.maxJsLanes,
     );
+    const { interrupted } = pauseState;
+    if (pause !== undefined && interrupted !== undefined) {
+      try {
+        await DefenseInDepthBox.runTrustedAsync(
+          async () =>
+            await pause.onInterrupted(interrupted, {
+              signal: combinedAbort.signal ?? timeoutController.signal,
+            }),
+        );
+      } catch {
+        // Fixed text: the error may carry the continuation, which must not
+        // reach stdout or stderr.
+        return diagnosticResult(
+          "js-exec: Could not hand off the paused script.\n",
+          1,
+          ctx.limits.maxOutputSize,
+        );
+      }
+    }
+    return result;
   } catch (error) {
     if (!(error instanceof JsExecQueueCanceledError)) throw error;
+    releaseResume();
     const timedOut = timeoutController.signal.aborted;
     return diagnosticResult(
       `js-exec: ${timedOut ? `Execution timeout: exceeded ${deadline.limitMs}ms limit` : "Execution aborted"}\n`,

@@ -21,6 +21,7 @@ import type {
   StatementNode,
   SubshellNode,
 } from "../ast/types.js";
+import type { InvokeTool } from "../Bash.js";
 import {
   decodedTextFromResult,
   latin1FromBytes,
@@ -145,11 +146,7 @@ export interface InterpreterOptions {
   /** Bootstrap JavaScript code for js-exec */
   jsBootstrapCode?: string;
   /** Tool invoker hook for js-exec's `tools` proxy */
-  invokeTool?: (
-    path: string,
-    argsJson: string,
-    abortSignal: AbortSignal,
-  ) => Promise<string>;
+  invokeTool?: InvokeTool;
 }
 
 export class Interpreter {

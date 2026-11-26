@@ -259,3 +259,9 @@ and/or `@executor-js/sdk` discovery (GraphQL, OpenAPI, MCP).
 - **Concurrency**: `maxJsLanes` (default 1, at most 32) runs at once across all `Bash` instances that share one copy of the module; later runs queue. `run` rejects runs beyond its worker cap ("maxWorkers limit reached"), so keep lanes under it or raise it with `run`'s `setMaxWorkers`
 - **Host bridge operations**: 8 MiB per-call payload ceiling, bounded by `maxJsBridgeRequests` (100,000 in the hardened profile and 1,000,000 otherwise)
 - **Engine**: QuickJS (compiled to WebAssembly)
+- **Filesystem settlement**: after a run ends, js-exec waits for every filesystem call and module read it started, so they land before the next command; a call that never settles keeps the lane, so filesystems must bound their own calls. The shell does not wait for that: when its own deadline (`maxExecutionTimeMs`) ends a script without tools, `exec()` returns after `maxExtensionCleanupTimeMs` and a write still in flight lands later
+- **Pause and resume** (`javascript.pause`):
+  - Output printed before the pause is only in the exit-75 result; the resumed result holds only what the script printed after it, so join the two
+  - Exit 75 alone does not prove a pause (a script can call `process.exit(75)`); a call to `onInterrupted` does
+  - `run` stops waiting for an encode at the deadline or an abort, but committing or rolling back a resume's decode transaction has no time bound of its own: the run keeps its worker and lane until the codec finishes
+  - A resume replays recorded tool results without calling the tools again, so their authorization is not checked again: claim each approval once and keep continuations on the server
