@@ -1231,7 +1231,8 @@ ${bootstrap}
     } else {
       output.exitCode = 1;
       const isGuestError =
-        RunError.isInstance(error) && error.code === "RUN_ERROR";
+        RunError.isInstance(error) &&
+        (error.code === "RUN_ERROR" || error.code === "RUN_USER_SOURCE_ERROR");
       const guestMessage = isGuestError
         ? formatGuestError(error, options, sourceLineOffset)
         : sanitizeHostErrorMessage(message);
