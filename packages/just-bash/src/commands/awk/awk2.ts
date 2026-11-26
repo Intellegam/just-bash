@@ -27,6 +27,10 @@ import {
   AwkInterpreter,
   createRuntimeContext,
 } from "./interpreter/index.js";
+import {
+  flushOutputFiles,
+  flushOutputFilesAfterFailure,
+} from "./interpreter/output-files.js";
 import { AwkParser } from "./parser2.js";
 
 const awkHelp = {
@@ -123,29 +127,13 @@ export const awkCommand2: RuntimeCommand = {
       return { stdout: "", stderr: `awk: ${msg}\n`, exitCode: 1 };
     }
 
-    // Create filesystem adapter with appendFile support
     const awkFs: AwkFileSystem = {
       readFile: ctx.fs.readFile.bind(ctx.fs),
       writeFile: ctx.fs.writeFile.bind(ctx.fs),
-      appendFile: async (path: string, content: string) => {
-        // Append by reading existing content and writing back
-        try {
-          const existing = await withDefenseContext("appendFile read", () =>
-            ctx.fs.readFile(path),
-          );
-          await withDefenseContext("appendFile write", () =>
-            ctx.fs.writeFile(path, existing + content),
-          );
-        } catch (e) {
-          if (e instanceof SecurityViolationError) {
-            throw e;
-          }
-          // File doesn't exist, just write
-          await withDefenseContext("appendFile create", () =>
-            ctx.fs.writeFile(path, content),
-          );
-        }
-      },
+      appendFile: (path: string, content: string) =>
+        withDefenseContext("appendFile write", () =>
+          ctx.fs.appendFile(path, content),
+        ),
       resolvePath: ctx.fs.resolvePath.bind(ctx.fs),
     };
 
@@ -199,8 +187,8 @@ export const awkCommand2: RuntimeCommand = {
     // Check if there are END blocks (need to read files to populate NR)
     const hasEndBlocks = ast.rules.some((rule) => rule.pattern?.type === "end");
 
-    // Execute BEGIN blocks
-    try {
+    const runProgram = async (): Promise<ExecResult> => {
+      // Execute BEGIN blocks
       await withDefenseContext("BEGIN execution", () => interp.executeBegin());
       if (runtimeCtx.shouldExit) {
         // exit in BEGIN still runs END blocks (AWK semantics)
@@ -284,6 +272,10 @@ export const awkCommand2: RuntimeCommand = {
 
       if (files.length > 0) {
         for (const file of files) {
+          // An input file may be one this awk writes.
+          await withDefenseContext("output flush before input file", () =>
+            flushOutputFiles(runtimeCtx),
+          );
           let content: string;
           try {
             const filePath = ctx.fs.resolvePath(ctx.cwd, file);
@@ -334,9 +326,26 @@ export const awkCommand2: RuntimeCommand = {
         stderr: "",
         exitCode: interp.getExitCode(),
       };
+    };
+
+    try {
+      const result = await withDefenseContext("program execution", runProgram);
+      await withDefenseContext("output flush", () =>
+        flushOutputFiles(runtimeCtx),
+      );
+      return result;
     } catch (e) {
       if (e instanceof SecurityViolationError) {
         throw e;
+      }
+      // Keep what was printed before the failure; the original error wins
+      // over a failed write here.
+      try {
+        await withDefenseContext("output flush after error", () =>
+          flushOutputFilesAfterFailure(runtimeCtx),
+        );
+      } catch (flushError) {
+        if (flushError instanceof SecurityViolationError) throw flushError;
       }
       // Handle errors during execution
       const msg = e instanceof Error ? e.message : String(e);

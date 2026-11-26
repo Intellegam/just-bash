@@ -23,6 +23,7 @@ import type {
 import { awkBuiltins } from "../builtins.js";
 import type { AwkRuntimeContext } from "./context.js";
 import { getField, setCurrentLine, setField } from "./fields.js";
+import { flushOutputFiles } from "./output-files.js";
 import {
   isTruthy,
   looksLikeNumber,
@@ -718,6 +719,10 @@ async function evalGetlineFromCommand(
 
   let stream = ctx.getlineCommandStreams.get(cmd);
   if (!stream) {
+    // The command may read files this awk writes.
+    await withDefenseContext(ctx, "output flush before getline command", () =>
+      flushOutputFiles(ctx),
+    );
     // First time running this command
     try {
       const result = await withDefenseContext(ctx, "getline command exec", () =>
@@ -790,6 +795,9 @@ async function evalGetlineFromFile(
 
   let stream = ctx.getlineFileStreams.get(filePath);
   if (!stream) {
+    await withDefenseContext(ctx, "output flush before getline file", () =>
+      flushOutputFiles(ctx),
+    );
     // First time reading this file
     try {
       const content = await withDefenseContext(ctx, "getline file read", () =>

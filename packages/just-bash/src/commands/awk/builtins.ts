@@ -598,6 +598,23 @@ async function awkSrand(
 
 // ─── Unsupported Functions ──────────────────────────────────────
 
+/**
+ * close() ends an output file's open state, so the next `>` truncates it
+ * again. Its pending text stays queued for the next barrier.
+ */
+async function awkClose(
+  args: AwkExpr[],
+  ctx: AwkRuntimeContext,
+  evaluator: AwkEvaluator,
+): Promise<AwkValue> {
+  if (args.length === 0) return 0;
+  const name = toAwkString(await evaluator.evalExpr(args[0]));
+  if (ctx.fs && ctx.cwd) {
+    ctx.openedFiles.delete(ctx.fs.resolvePath(ctx.cwd, name));
+  }
+  return 0;
+}
+
 function unsupported(name: string, reason: string): AwkBuiltinFn {
   return () => {
     throw new Error(`${name}() is not supported - ${reason}`);
@@ -1041,9 +1058,9 @@ export const awkBuiltins: Map<string, AwkBuiltinFn> = new Map([
       "shell execution not allowed in sandboxed environment",
     ),
   ],
-  // close() and fflush() are no-ops in our environment (no real file handles)
-  // Return 0 for success to allow programs that use them to work
-  ["close", () => 0],
+  ["close", awkClose],
+  // Output files are flushed at barriers (see output-files.ts), so fflush()
+  // only reports success.
   ["fflush", () => 0],
 
   // Unimplemented functions

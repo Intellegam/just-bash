@@ -84,8 +84,13 @@ export interface AwkRuntimeContext {
   fs?: AwkFileSystem;
   cwd?: string;
 
-  // Track which files have been opened with > (for overwrite-then-append behavior)
+  // Output files open since their first write or last close(); a `>` to a
+  // file not in this set truncates it.
   openedFiles: Set<string>;
+  // Text not yet written to each output file; see output-files.ts.
+  pendingOutput: Map<string, string[]>;
+  pendingOutputChars: number;
+  pendingOutputWrites: number;
 
   // Random function override for testing
   random?: () => number;
@@ -183,6 +188,9 @@ export function createRuntimeContext(
 
     output: "",
     openedFiles: new Set(),
+    pendingOutput: new Map(),
+    pendingOutputChars: 0,
+    pendingOutputWrites: 0,
 
     fs,
     cwd,

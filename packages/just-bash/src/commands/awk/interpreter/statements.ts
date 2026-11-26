@@ -14,6 +14,7 @@ import type { AwkArrayAccess, AwkExpr, AwkStmt, AwkVariable } from "../ast.js";
 import { formatPrintf } from "../builtins.js";
 import type { AwkRuntimeContext } from "./context.js";
 import { evalExpr, setBlockExecutor } from "./expressions.js";
+import { discardPendingOutput, queueFileOutput } from "./output-files.js";
 import { isTruthy, toAwkString, toNumber } from "./type-coercion.js";
 import { deleteArray, deleteArrayElement } from "./variables.js";
 
@@ -300,30 +301,20 @@ async function writeToFile(
   );
   const filePath = fs.resolvePath(ctx.cwd, filename);
 
-  if (redirect === ">") {
-    // Overwrite mode: first write clears file, subsequent writes append
-    if (!ctx.openedFiles.has(filePath)) {
-      // First write - overwrite (write empty first, then append)
-      await withDefenseContext(ctx, "redirection overwrite write", () =>
-        fs.writeFile(filePath, text),
-      );
-      ctx.openedFiles.add(filePath);
-    } else {
-      // Subsequent write - append
-      await withDefenseContext(ctx, "redirection append write", () =>
-        fs.appendFile(filePath, text),
-      );
-    }
-  } else {
-    // Append mode: always append
-    if (!ctx.openedFiles.has(filePath)) {
-      // First time seeing this file in append mode
-      ctx.openedFiles.add(filePath);
-    }
-    await withDefenseContext(ctx, "redirection append mode write", () =>
-      fs.appendFile(filePath, text),
+  if (redirect === ">" && !ctx.openedFiles.has(filePath)) {
+    // The first `>` since the file was opened or closed truncates it, which
+    // also discards text still pending from an earlier `>>`.
+    await withDefenseContext(ctx, "redirection overwrite write", () =>
+      fs.writeFile(filePath, text),
     );
+    ctx.openedFiles.add(filePath);
+    discardPendingOutput(ctx, filePath);
+    return;
   }
+  ctx.openedFiles.add(filePath);
+  await withDefenseContext(ctx, "redirection queued write", () =>
+    queueFileOutput(ctx, filePath, text),
+  );
 }
 
 /**
