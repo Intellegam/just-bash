@@ -121,6 +121,12 @@ export interface ExecutionLimits {
   /** Maximum JavaScript host-bridge operations (normal default: 1000000) */
   maxJsBridgeRequests?: number;
 
+  /**
+   * Maximum QuickJS heap bytes for one js-exec run (default: 64 MiB).
+   * A positive safe integer at most 2147483647, the largest limit run accepts.
+   */
+  maxJsMemoryBytes?: number;
+
   /** Maximum glob filesystem operations (normal default: 1000000) */
   maxGlobOperations?: number;
 
@@ -160,6 +166,8 @@ export const DEFAULT_MAX_SOURCE_BYTES: number = 64 * 1024 * 1024;
  * These liberal compatibility defaults remain bounded. Select the hardened
  * profile for tighter untrusted-workload policy.
  */
+const MAX_JS_MEMORY_BYTES = 2_147_483_647;
+
 const DEFAULT_LIMITS: Required<ExecutionLimits> = {
   maxSourceBytes: DEFAULT_MAX_SOURCE_BYTES,
   maxExecDepth: 64,
@@ -204,6 +212,7 @@ const DEFAULT_LIMITS: Required<ExecutionLimits> = {
   maxPythonTimeoutMs: 30000,
   maxJsTimeoutMs: 30000,
   maxJsBridgeRequests: 1_000_000,
+  maxJsMemoryBytes: 64 * 1024 * 1024,
   maxGlobOperations: 1000000,
   maxStringLength: 64 * 1024 * 1024,
   maxArrayElements: 1000000,
@@ -332,6 +341,7 @@ export function resolveLimits(
     maxJsTimeoutMs: userLimits.maxJsTimeoutMs ?? defaults.maxJsTimeoutMs,
     maxJsBridgeRequests:
       userLimits.maxJsBridgeRequests ?? defaults.maxJsBridgeRequests,
+    maxJsMemoryBytes: userLimits.maxJsMemoryBytes ?? defaults.maxJsMemoryBytes,
     maxGlobOperations:
       userLimits.maxGlobOperations ?? defaults.maxGlobOperations,
     maxStringLength: userLimits.maxStringLength ?? defaults.maxStringLength,
@@ -347,6 +357,15 @@ export function resolveLimits(
     maxSourceDepth: userLimits.maxSourceDepth ?? defaults.maxSourceDepth,
   };
 
+  if (
+    !Number.isSafeInteger(resolved.maxJsMemoryBytes) ||
+    resolved.maxJsMemoryBytes <= 0 ||
+    resolved.maxJsMemoryBytes > MAX_JS_MEMORY_BYTES
+  ) {
+    throw new RangeError(
+      `maxJsMemoryBytes must be a positive safe integer at most ${MAX_JS_MEMORY_BYTES}`,
+    );
+  }
   for (const key of Object.keys(resolved) as (keyof ExecutionLimits)[]) {
     const value = resolved[key];
     if (value === Number.POSITIVE_INFINITY) {
