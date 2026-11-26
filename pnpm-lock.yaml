@@ -14,7 +14,7 @@ overrides:
 
 patchedDependencies:
   run@2.1.13:
-    hash: 9f523c4f8482aa15d5fea3edbc87250801f814b3cd921c82c9517b66fdf8ace4
+    hash: 6e758c8fe804061309c87dc6756f378c68f347fd852fc6bbe3614ea9dbf4e430
     path: patches/run@2.1.13.patch
 
 importers:
@@ -195,7 +195,7 @@ importers:
         version: 1.3.3
       run:
         specifier: 2.1.13
-        version: 2.1.13(patch_hash=9f523c4f8482aa15d5fea3edbc87250801f814b3cd921c82c9517b66fdf8ace4)(typescript@5.9.3)
+        version: 2.1.13(patch_hash=6e758c8fe804061309c87dc6756f378c68f347fd852fc6bbe3614ea9dbf4e430)(typescript@5.9.3)
       seek-bzip:
         specifier: ^2.0.0
         version: 2.0.0
@@ -8612,7 +8612,7 @@ snapshots:
     dependencies:
       queue-microtask: 1.2.3
 
-  run@2.1.13(patch_hash=9f523c4f8482aa15d5fea3edbc87250801f814b3cd921c82c9517b66fdf8ace4)(typescript@5.9.3):
+  run@2.1.13(patch_hash=6e758c8fe804061309c87dc6756f378c68f347fd852fc6bbe3614ea9dbf4e430)(typescript@5.9.3):
     optionalDependencies:
       typescript: 5.9.3
 
