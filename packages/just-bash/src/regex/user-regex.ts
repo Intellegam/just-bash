@@ -73,7 +73,7 @@ function convertFlags(flags: string): number {
  * Translate a JavaScript regex pattern to RE2-compatible syntax.
  * Uses RE2JS.translateRegExp to handle syntax differences.
  */
-function translatePattern(pattern: string): string {
+export function translatePattern(pattern: string): string {
   return RE2JS.translateRegExp(pattern);
 }
 

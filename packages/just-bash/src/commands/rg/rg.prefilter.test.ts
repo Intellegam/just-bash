@@ -2,15 +2,14 @@ import { describe, expect, it } from "vitest";
 import { Bash } from "../../Bash.js";
 
 /**
- * rg skips files and lines that lack a pattern's required literals before
- * RE2 runs. These cases pin output where a wrong requirement would drop a
- * match or a line rg must still print.
+ * These cases pin output where a wrong requirement would drop a match or a
+ * line rg must still print.
  */
 
 const files = {
   "/w/a.txt": "abbbc\nbarbaz\nupdate the product\nproduct only\n",
   "/w/b.txt": "nothing here\nat all\n",
-  "/w/fold.txt": "ſAP order\nKelvin scale\nplain\n",
+  "/w/fold.txt": "ſAP order\n\u212Aelvin scale\nplain\n",
 };
 
 async function rg(command: string) {
@@ -41,7 +40,7 @@ describe("rg required-literal prefilter", () => {
     const result = await rg("rg -i 'sap|kelvin' fold.txt");
     expect(result).toMatchObject({
       exitCode: 0,
-      stdout: "ſAP order\nKelvin scale\n",
+      stdout: "ſAP order\n\u212Aelvin scale\n",
       stderr: "",
     });
   });

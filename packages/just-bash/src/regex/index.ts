@@ -20,6 +20,7 @@ export {
   createUserRegex,
   type RegexLike,
   type ReplaceCallback,
+  translatePattern,
   UserRegex,
   type UserRegexLimits,
 } from "./user-regex.js";

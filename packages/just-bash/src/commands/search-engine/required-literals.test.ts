@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { preFilterMatches, requiredLiterals } from "./required-literals.js";
+import {
+  lineMayMatch,
+  type PreFilter,
+  preFilterMatches,
+  requiredLiterals,
+} from "./required-literals.js";
 
 const groups = (pattern: string, ignoreCase = false) =>
   requiredLiterals(pattern, ignoreCase)?.groups ?? null;
@@ -37,9 +42,29 @@ describe("requiredLiterals", () => {
     ]);
   });
 
-  it("requires nothing of an alternation past the group limit", () => {
-    const many = Array.from({ length: 65 }, (_, i) => `word${i}`).join("|");
+  it("requires nothing of a compound alternation past the group limit", () => {
+    const many = Array.from({ length: 65 }, (_, i) => `word${i}.x`).join("|");
     expect(groups(many)).toBeNull();
+  });
+
+  it("keeps every literal of a plain literal list past the group limit", () => {
+    const words = Array.from({ length: 65 }, (_, i) => `word${i}`);
+    expect(groups(words.join("|"))).toEqual(words.map((word) => [word]));
+    // Inside the wrappers -w and -x add, and inside a group.
+    for (const wrapped of [
+      `\\b(?:${words.join("|")})\\b`,
+      `^(?:${words.join("|")})$`,
+      `(${words.join("|")})`,
+    ]) {
+      expect(groups(wrapped)).toEqual(words.map((word) => [word]));
+    }
+    expect(groups(`${words.join("|")}|`)).toBeNull();
+  });
+
+  it("keeps one side once the analysis has combined its share of groups", () => {
+    const alternatives = Array.from({ length: 64 }, (_, i) => `z${i}`);
+    const pattern = `a.b.(?:${alternatives.join("|")})${".x".repeat(1850)}`;
+    expect(groups(pattern)).toEqual([["x"]]);
   });
 
   it("decodes escaped symbols, named groups and surrogate pairs", () => {
@@ -76,8 +101,14 @@ describe("requiredLiterals", () => {
     expect(groups("foo\0bar|foo.*bar")).toEqual([["foo\0bar"], ["foo", "bar"]]);
   });
 
+  it("leaves a pattern too long to analyse cheaply unfiltered", () => {
+    expect(groups(`${"a".repeat(4096)}`)).toEqual([["a".repeat(64)]]);
+    expect(groups(`${"a".repeat(4097)}`)).toBeNull();
+  });
+
   it("gives up on deep nesting instead of recursing without bound", () => {
-    expect(groups(`${"(".repeat(10_000)}a${")".repeat(10_000)}`)).toBeNull();
+    expect(groups(`${"(".repeat(64)}ab${")".repeat(64)}`)).toEqual([["ab"]]);
+    expect(groups(`${"(".repeat(65)}ab${")".repeat(65)}`)).toBeNull();
   });
 
   it("keeps the ASCII runs of needles under ignoreCase", () => {
@@ -115,5 +146,28 @@ describe("preFilterMatches", () => {
     expect(preFilterMatches(preFilter, "ſAP")).toBe(true);
     expect(preFilterMatches(preFilter, "Kelvin")).toBe(true);
     expect(preFilterMatches(preFilter, "SA P")).toBe(false);
+  });
+});
+
+describe("lineMayMatch", () => {
+  const checks = (preFilter: PreFilter, line: string) => {
+    const calls: (boolean | undefined)[] = [];
+    lineMayMatch(preFilter, line, (force) => calls.push(force));
+    return calls;
+  };
+
+  it("checks the deadline once the needle scans of a line add up to 64 Ki characters", () => {
+    const many: PreFilter = {
+      groups: Array.from({ length: 100 }, (_, i) => [`zq${i}`]),
+      ignoreCase: false,
+    };
+    // 101 passes over 1,000 characters: one check.
+    expect(checks(many, "a".repeat(1000))).toEqual([true]);
+    expect(checks(many, "a".repeat(100))).toEqual([]);
+  });
+
+  it("checks the deadline before every scan of a 64 Ki line", () => {
+    const two: PreFilter = { groups: [["zq"], ["zr"]], ignoreCase: false };
+    expect(checks(two, "a".repeat(1 << 16))).toEqual([true, true, true]);
   });
 });

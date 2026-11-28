@@ -2,14 +2,7 @@ import { describe, expect, it } from "vitest";
 import { buildRegex } from "./regex.js";
 
 /**
- * Direct tests for the preFilter extractor inside buildRegex.
- *
- * The extractor is the safety-critical part of the perf/grep optimisation:
- * a false-positive needle (extracting a literal that isn't actually required
- * by the regex) causes searchContent to skip lines the regex would have
- * matched — a silent correctness bug. These tests cover what each pattern
- * requires, and the patterns that require nothing (extraction must return
- * `undefined`, falling back to the unfiltered regex scan).
+ * What buildRegex's translated patterns (BRE, -F, -w, -i) require.
  * required-literals.test.ts covers the analysis itself.
  */
 
@@ -21,13 +14,13 @@ describe("buildRegex preFilter — happy path", () => {
     });
   });
 
-  it("strips -w wrapper for single literal", () => {
+  it("requires the literal inside the -w wrapper", () => {
     expect(
       buildRegex("type", { mode: "basic", wholeWord: true }).preFilter,
     ).toEqual({ groups: [["type"]], ignoreCase: false });
   });
 
-  it("strips -w wrapper around alternation", () => {
+  it("requires each literal of an alternation inside the -w wrapper", () => {
     expect(
       buildRegex("foo|bar", { mode: "extended", wholeWord: true }).preFilter,
     ).toEqual({ groups: [["foo"], ["bar"]], ignoreCase: false });
@@ -158,7 +151,6 @@ describe("buildRegex preFilter — quantifiers, classes, groups and escapes", ()
   });
 
   it("requires the literal after a bare \\b word boundary", () => {
-    // Distinct from the -w wrapper case: \b is the *content*, not a frame
     expect(buildRegex("\\bfoo", { mode: "extended" }).preFilter).toEqual({
       groups: [["foo"]],
       ignoreCase: false,
@@ -233,7 +225,6 @@ describe("buildRegex preFilter — quantifiers, classes, groups and escapes", ()
 
 describe("buildRegex preFilter — structural correctness", () => {
   it("does not split | inside non-capturing group", () => {
-    // (?:a|b)c has no top-level alternation; it must NOT be split into ["(?:a", "b)c"]
     expect(buildRegex("(?:a|b)c", { mode: "extended" }).preFilter).toEqual({
       groups: [
         ["a", "c"],
@@ -251,14 +242,6 @@ describe("buildRegex preFilter — structural correctness", () => {
     expect(
       buildRegex("alpha|beta|gamma", { mode: "extended" }).preFilter,
     ).toEqual({ groups: [["alpha"], ["beta"], ["gamma"]], ignoreCase: false });
-  });
-
-  it("does not over-strip when pattern just starts with \\b", () => {
-    // "\bfoo" (no closing \b) is not a -w wrap, but still requires "foo"
-    expect(buildRegex("\\bfoo", { mode: "extended" }).preFilter).toEqual({
-      groups: [["foo"]],
-      ignoreCase: false,
-    });
   });
 
   it("returns undefined for empty pattern", () => {

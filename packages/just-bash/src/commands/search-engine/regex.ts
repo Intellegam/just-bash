@@ -2,7 +2,11 @@
  * Regex building utilities for search commands
  */
 
-import { createUserRegex, type UserRegex } from "../../regex/index.js";
+import {
+  createUserRegex,
+  translatePattern,
+  type UserRegex,
+} from "../../regex/index.js";
 import { type PreFilter, requiredLiterals } from "./required-literals.js";
 
 export type { PreFilter } from "./required-literals.js";
@@ -41,11 +45,7 @@ export interface RegexResult {
   regex: UserRegex;
   /** If \K was used, this is the 1-based index of the capture group containing the "real" match */
   kResetGroup?: number;
-  /**
-   * Optional fast-path filter: the literals every match contains. Text without
-   * them provably cannot match, so RE2 can be skipped for it. Absent when the
-   * pattern requires no literal the analysis can prove.
-   */
+  /** Required literals for the matcher's fast path; absent when none is provable. */
   preFilter?: PreFilter;
 }
 
@@ -230,12 +230,14 @@ export function buildRegex(
     (options.multiline ? "m" : "") +
     (options.multilineDotall ? "s" : "") +
     (needsUnicode ? "u" : "");
-  const preFilter = requiredLiterals(regexPattern, options.ignoreCase ?? false);
-  return {
-    regex: createUserRegex(regexPattern, flags),
-    kResetGroup,
-    preFilter: preFilter ?? undefined,
-  };
+  const regex = createUserRegex(regexPattern, flags);
+  // The translation is what RE2 parses; it can read an escape after a
+  // non-ASCII character differently from JavaScript.
+  const preFilter = requiredLiterals(
+    translatePattern(regexPattern),
+    options.ignoreCase ?? false,
+  );
+  return { regex, kResetGroup, preFilter: preFilter ?? undefined };
 }
 
 /**

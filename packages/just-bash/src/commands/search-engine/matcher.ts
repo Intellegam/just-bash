@@ -7,7 +7,11 @@ import {
   ExecutionLimitError,
 } from "../../interpreter/errors.js";
 import type { UserRegex } from "../../regex/index.js";
-import { type PreFilter, preFilterMatches } from "./required-literals.js";
+import {
+  lineMayMatch,
+  type PreFilter,
+  preFilterMatches,
+} from "./required-literals.js";
 
 /**
  * Apply a replacement pattern using capture groups from a regex match
@@ -68,10 +72,7 @@ export interface SearchOptions {
   multiline?: boolean;
   /** If \K was used, this is the capture group index containing the "real" match */
   kResetGroup?: number;
-  /**
-   * Optional substring fast-path: skip RE2 entirely for a file or line that
-   * lacks the pattern's required literals. Pre-computed by buildRegex.
-   */
+  /** From buildRegex: skips RE2 for a file or line without the required literals. */
   preFilter?: PreFilter | null;
   /** Maximum synchronous matching/formatting work units. */
   maxWork?: number;
@@ -134,6 +135,20 @@ export function searchContent(
     checkpoint,
   } = options;
 
+  // Inverted and passthru output still print a file without the literals.
+  if (
+    preFilter &&
+    !invertMatch &&
+    !passthru &&
+    !preFilterMatches(preFilter, content, checkpoint)
+  ) {
+    if (countOnly || countMatches) {
+      const countStr = filename ? `${filename}:0` : "0";
+      return { output: `${countStr}\n`, matched: false, matchCount: 0 };
+    }
+    return { output: "", matched: false, matchCount: 0 };
+  }
+
   // Multiline mode: search entire content as one string
   if (multiline) {
     return searchContentMultiline(content, regex, {
@@ -151,27 +166,11 @@ export function searchContent(
       showByteOffset,
       replace,
       kResetGroup,
-      preFilter,
       maxWork,
       maxMatches,
       signal,
       checkpoint,
     });
-  }
-
-  // A file without the required literals has no matching line, so neither the
-  // line split nor RE2 runs. Inverting or passthru must still print its lines.
-  if (
-    preFilter &&
-    !invertMatch &&
-    !passthru &&
-    !preFilterMatches(preFilter, content, checkpoint)
-  ) {
-    if (countOnly || countMatches) {
-      const countStr = filename ? `${filename}:0` : "0";
-      return { output: `${countStr}\n`, matched: false, matchCount: 0 };
-    }
-    return { output: "", matched: false, matchCount: 0 };
   }
 
   let work = 0;
@@ -229,10 +228,14 @@ export function searchContent(
       if (maxCount > 0 && matchingLineCount >= maxCount) break;
       const countBeforeLine = matchCount;
       const line = lines[i];
-      // Pre-filter: skip lines that can't contain any required literal.
+      // Pre-filter: skip lines without the required literals.
       // For invertMatch=true (-vc), a no-match line still counts, so we
       // can't skip it — only short-circuit when not inverting.
-      if (preFilter && !invertMatch && !preFilterMatches(preFilter, line)) {
+      if (
+        preFilter &&
+        !invertMatch &&
+        !lineMayMatch(preFilter, line, checkpoint)
+      ) {
         continue;
       }
       regex.lastIndex = 0;
@@ -274,12 +277,8 @@ export function searchContent(
       if (maxCount > 0 && matchCount >= maxCount) break;
 
       const line = lines[i];
-      // Substring pre-filter: when no extracted needle is present, the
-      // regex provably cannot match. String.indexOf is ~50x faster than
-      // RE2.find() for short inputs, so we skip the regex for the bulk
-      // of unmatching lines.
       let firstMatch: RegExpExecArray | null = null;
-      if (preFilter && !preFilterMatches(preFilter, line)) {
+      if (preFilter && !lineMayMatch(preFilter, line, checkpoint)) {
         // firstMatch stays null → matches stays false
       } else {
         regex.lastIndex = 0;
@@ -388,7 +387,7 @@ export function searchContent(
       chargeWork();
       const line = lines[i];
       let matches: boolean;
-      if (preFilter && !preFilterMatches(preFilter, line)) {
+      if (preFilter && !lineMayMatch(preFilter, line, checkpoint)) {
         matches = false;
       } else {
         regex.lastIndex = 0;
@@ -429,7 +428,7 @@ export function searchContent(
     if (maxCount > 0 && matchCount >= maxCount) break;
     const line = lines[i];
     let matches: boolean;
-    if (preFilter && !preFilterMatches(preFilter, line)) {
+    if (preFilter && !lineMayMatch(preFilter, line, checkpoint)) {
       matches = false;
     } else {
       regex.lastIndex = 0;
@@ -537,7 +536,6 @@ function searchContentMultiline(
     showByteOffset: boolean;
     replace: string | null;
     kResetGroup?: number;
-    preFilter?: PreFilter | null;
     maxWork?: number;
     maxMatches?: number;
     signal?: AbortSignal;
@@ -559,7 +557,6 @@ function searchContentMultiline(
     showByteOffset,
     replace,
     kResetGroup,
-    preFilter,
     maxWork,
     maxMatches,
     signal,
@@ -578,20 +575,6 @@ function searchContentMultiline(
       );
     }
   };
-
-  // File-level preFilter: if no needle appears anywhere in the content, no line can match.
-  // Only safe when not inverting — an invert-match scan must check every line.
-  if (
-    preFilter &&
-    !invertMatch &&
-    !preFilterMatches(preFilter, content, checkpoint)
-  ) {
-    if (countOnly || countMatches) {
-      const countStr = filename ? `${filename}:0` : "0";
-      return { output: `${countStr}\n`, matched: false, matchCount: 0 };
-    }
-    return { output: "", matched: false, matchCount: 0 };
-  }
 
   // Build line offset map: lineOffsets[i] = byte offset where line i starts
   const lineOffsets: number[] = [0];

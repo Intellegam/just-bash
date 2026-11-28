@@ -158,9 +158,9 @@ describe("execution deadline inside one command", () => {
 
   it("grep stops between the needles of the whole-file literal prefilter", async () => {
     // Each needle scans the whole file, so each reads the clock. grep reads
-    // it about 16 times outside its loops, so 60 absent needles pass a 40 ms
-    // deadline only inside this loop. The filter keeps at most 64 alternatives.
-    const needles = Array.from({ length: 60 }, (_, i) => `zq${i}`);
+    // it about 16 times outside its loops, so 100 absent needles pass a 40 ms
+    // deadline only inside this loop.
+    const needles = Array.from({ length: 100 }, (_, i) => `zq${i}`);
     const run = tickPerRead({ "/in.txt": lines(200) }, 40);
 
     expect(await run(`grep -c -E '${needles.join("|")}' /in.txt`)).toEqual(

@@ -18,15 +18,23 @@ export interface PreFilter {
   ignoreCase: boolean;
 }
 
-/** Groups kept for a pattern; a larger product keeps one side instead. */
+/** Groups a requirement keeps: past it a concatenation keeps one side, and an alternation other than a plain literal list requires nothing. */
 // @banned-pattern-ignore: bounds the prefilter analysis; past it the filter requires less and output is unchanged
 const MAX_GROUPS = 64;
 /** Needles kept per group, the longest first. */
 // @banned-pattern-ignore: bounds the prefilter analysis; past it the filter requires less and output is unchanged
 const MAX_NEEDLES = 8;
-/** Group nesting the analysis follows before it gives up on a pattern. */
+/** Needle prefix kept: a substring scan can cost the text times the needle length. */
+// @banned-pattern-ignore: bounds the prefilter's scans; a prefix of a required literal is required too, so output is unchanged
+const MAX_NEEDLE_CHARS = 64;
 // @banned-pattern-ignore: bounds the prefilter analysis; past it the pattern is scanned without a filter
 const MAX_DEPTH = 64;
+/** Pattern length analysed; deduplicating long needles costs about its square. */
+// @banned-pattern-ignore: bounds the prefilter analysis; past it the pattern is scanned without a filter
+const MAX_PATTERN_CHARS = 4096;
+/** Group pairs combined per pattern, so the analysis stays within milliseconds. */
+// @banned-pattern-ignore: bounds the prefilter analysis; past it the filter requires less and output is unchanged
+const MAX_COMBINATIONS = 4096;
 
 /** What part of a pattern requires: alternatives of needle sets. `[[]]` requires nothing. */
 type Requirement = string[][];
@@ -44,16 +52,16 @@ const CONTROL_ESCAPES = new Map([
 /** Escapes of a character class or an assertion: they match no fixed text. */
 const CLASS_ESCAPES = "dDwWsSbB";
 
-/** A construct whose meaning the analysis does not model. */
 class UnsupportedPattern extends Error {}
 
 function requiresNothing(requirement: Requirement): boolean {
   return requirement.some((group) => group.length === 0);
 }
 
-/** A group without needles another needle contains, at most MAX_NEEDLES of them, the longest first. */
 function capped(group: string[]): string[] {
-  const unique = [...new Set(group)].sort((a, b) => b.length - a.length);
+  const unique = [
+    ...new Set(group.map((needle) => needle.slice(0, MAX_NEEDLE_CHARS))),
+  ].sort((a, b) => b.length - a.length);
   const kept: string[] = [];
   for (const needle of unique) {
     if (kept.length === MAX_NEEDLES) break;
@@ -62,7 +70,6 @@ function capped(group: string[]): string[] {
   return kept;
 }
 
-/** Groups with a duplicate removed: capped groups list their needles in one order. */
 function distinct(groups: Requirement): Requirement {
   const seen = new Set<string>();
   return groups.filter((group) => {
@@ -80,20 +87,6 @@ function either(left: Requirement, right: Requirement): Requirement {
   return groups.length > MAX_GROUPS ? NOTHING : groups;
 }
 
-function both(left: Requirement, right: Requirement): Requirement {
-  if (requiresNothing(left)) return right;
-  if (requiresNothing(right)) return left;
-  // Each side alone is still required; keep the one with fewer alternatives.
-  if (left.length * right.length > MAX_GROUPS) {
-    return left.length <= right.length ? left : right;
-  }
-  const groups: Requirement = [];
-  for (const a of left) {
-    for (const b of right) groups.push(capped([...a, ...b]));
-  }
-  return distinct(groups);
-}
-
 type Atom = { literal: string } | { requirement: Requirement };
 
 /** A parsed part of a pattern; `exact` is the one literal it matches, when it matches only that. */
@@ -104,6 +97,7 @@ interface Parsed {
 
 class RequirementParser {
   private position = 0;
+  private combinations = 0;
 
   constructor(private readonly pattern: string) {}
 
@@ -114,17 +108,43 @@ class RequirementParser {
     return requirement;
   }
 
+  private both(left: Requirement, right: Requirement): Requirement {
+    if (requiresNothing(left)) return right;
+    if (requiresNothing(right)) return left;
+    const product = left.length * right.length;
+    this.combinations += product;
+    // Each side alone is still required; keep the one with fewer alternatives.
+    if (product > MAX_GROUPS || this.combinations > MAX_COMBINATIONS) {
+      return left.length <= right.length ? left : right;
+    }
+    const groups: Requirement = [];
+    for (const a of left) {
+      for (const b of right) groups.push(capped([...a, ...b]));
+    }
+    return distinct(groups);
+  }
+
   private alternation(depth: number): Parsed {
     if (depth > MAX_DEPTH) throw new UnsupportedPattern();
-    const first = this.concatenation(depth);
-    let requirement = first.requirement;
-    let exact = first.exact;
+    const alternatives = [this.concatenation(depth)];
     while (this.pattern[this.position] === "|") {
       this.position++;
-      requirement = either(requirement, this.concatenation(depth).requirement);
-      exact = null;
+      alternatives.push(this.concatenation(depth));
     }
-    return { exact, requirement };
+    if (alternatives.length === 1) return alternatives[0];
+    // A list of plain literals requires one of them past the group limit too;
+    // the pattern length cap bounds how many.
+    if (alternatives.every(({ exact }) => exact)) {
+      return {
+        exact: null,
+        requirement: distinct(alternatives.map(({ exact }) => [exact ?? ""])),
+      };
+    }
+    let requirement = alternatives[0].requirement;
+    for (let i = 1; i < alternatives.length; i++) {
+      requirement = either(requirement, alternatives[i].requirement);
+    }
+    return { exact: null, requirement };
   }
 
   private concatenation(depth: number): Parsed {
@@ -132,7 +152,7 @@ class RequirementParser {
     let exact: string | null = "";
     let run = "";
     const flush = (): void => {
-      if (run !== "") requirement = both(requirement, [[run]]);
+      if (run !== "") requirement = this.both(requirement, [[run]]);
       run = "";
     };
     while (this.position < this.pattern.length) {
@@ -159,7 +179,7 @@ class RequirementParser {
       }
       flush();
       if (minimum === null || minimum > 0) {
-        requirement = both(requirement, atom.requirement);
+        requirement = this.both(requirement, atom.requirement);
       }
     }
     flush();
@@ -335,7 +355,7 @@ function isWordChar(char: string): boolean {
   );
 }
 
-/** The ASCII runs of a needle, lowercased: what RE2's case folding requires of them as text. */
+/** The lowercased ASCII runs of a needle. */
 function foldedAsciiRuns(needle: string): string[] {
   const runs: string[] = [];
   let run = "";
@@ -366,6 +386,7 @@ export function requiredLiterals(
   pattern: string,
   ignoreCase: boolean,
 ): PreFilter | null {
+  if (pattern.length > MAX_PATTERN_CHARS) return null;
   let requirement: Requirement;
   try {
     requirement = new RequirementParser(pattern).parse();
@@ -384,31 +405,45 @@ export function requiredLiterals(
 
 /**
  * Case-folds text for ASCII needles as RE2 does: of the non-ASCII letters RE2
- * folds into ASCII, U+212A (K) lowercases to k, but U+017F (ſ) lowercases to
+ * folds into ASCII, U+212A lowercases to k, but U+017F (ſ) lowercases to
  * itself, so it becomes s.
  */
-function foldCase(text: string): string {
+function foldCase(
+  text: string,
+  checkpoint?: (force?: boolean) => void,
+): string {
   const lower = text.toLowerCase();
-  return lower.includes("ſ") ? lower.replaceAll("ſ", "s") : lower;
+  checkpoint?.(true);
+  if (!lower.includes("ſ")) return lower;
+  checkpoint?.(true);
+  return lower.replaceAll("ſ", "s");
 }
 
 /**
- * Whether text may match: it contains every needle of at least one group.
- * A whole-input check passes `checkpoint`: each needle scans all of it.
+ * The deadline is checked before a pass over the text once the passes since
+ * the last check have scanned `checkEveryChars` characters.
  */
-export function preFilterMatches(
+function mayMatch(
   preFilter: PreFilter,
   text: string,
-  checkpoint?: (force?: boolean) => void,
+  checkpoint: ((force?: boolean) => void) | undefined,
+  checkEveryChars: number,
 ): boolean {
-  checkpoint?.(true);
-  const haystack = preFilter.ignoreCase ? foldCase(text) : text;
+  let scanned = 0;
+  const beforePass = (): void => {
+    scanned += text.length;
+    if (scanned < checkEveryChars) return;
+    checkpoint?.(true);
+    scanned = 0;
+  };
+  beforePass();
+  const haystack = preFilter.ignoreCase ? foldCase(text, beforePass) : text;
   const groups = preFilter.groups;
   for (let g = 0; g < groups.length; g++) {
     const needles = groups[g];
     let found = true;
     for (let n = 0; n < needles.length; n++) {
-      checkpoint?.(true);
+      beforePass();
       if (!haystack.includes(needles[n])) {
         found = false;
         break;
@@ -417,4 +452,22 @@ export function preFilterMatches(
     if (found) return true;
   }
   return false;
+}
+
+/** Whether a whole input may match; each pass over it checks the deadline. */
+export function preFilterMatches(
+  preFilter: PreFilter,
+  text: string,
+  checkpoint?: (force?: boolean) => void,
+): boolean {
+  return mayMatch(preFilter, text, checkpoint, 0);
+}
+
+/** Whether a line may match; the deadline is checked per 64 Ki characters scanned. */
+export function lineMayMatch(
+  preFilter: PreFilter,
+  line: string,
+  checkpoint?: (force?: boolean) => void,
+): boolean {
+  return mayMatch(preFilter, line, checkpoint, 1 << 16);
 }

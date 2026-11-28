@@ -2,27 +2,7 @@ import { describe, expect, it } from "vitest";
 import { searchContent } from "./matcher.js";
 import { buildRegex, type PreFilter } from "./regex.js";
 
-describe("preFilterMatches — substring fast-path", () => {
-  it.each([
-    false,
-    true,
-  ])("checks the deadline before each whole-input scan (multiline: %s)", (multiline) => {
-    const { regex } = buildRegex("zq", { mode: "basic" });
-    const preFilter: PreFilter = {
-      groups: [["zq"], ["zr"], ["zs"]],
-      ignoreCase: false,
-    };
-    const calls: (boolean | undefined)[] = [];
-    searchContent("a\nb\n", regex, {
-      multiline,
-      preFilter,
-      checkpoint: (force) => calls.push(force),
-    });
-
-    // The case fold, then one per needle.
-    expect(calls).toEqual([true, true, true, true]);
-  });
-
+describe("searchContent prefilter", () => {
   it("bounds ordinary line matching work", () => {
     const { regex } = buildRegex("x", { mode: "basic" });
     expect(() =>
@@ -86,20 +66,6 @@ describe("preFilterMatches — substring fast-path", () => {
     });
     expect(result.output).toBe("bar\nbaz\n");
     expect(result.matchCount).toBe(2);
-  });
-
-  it("skips a line that lacks one needle of a group", () => {
-    const content = "product\nupdate\nupdate product\n";
-    const { regex, preFilter } = buildRegex("product.*update|update.*product", {
-      mode: "extended",
-    });
-    expect(preFilter).toEqual({
-      groups: [["product", "update"]],
-      ignoreCase: false,
-    });
-    expect(searchContent(content, regex, { preFilter }).output).toBe(
-      "update product\n",
-    );
   });
 
   it("reports a zero count for a file without the required literals", () => {
