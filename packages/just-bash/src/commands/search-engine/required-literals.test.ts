@@ -42,9 +42,15 @@ describe("requiredLiterals", () => {
     ]);
   });
 
-  it("requires nothing of a compound alternation past the group limit", () => {
-    const many = Array.from({ length: 65 }, (_, i) => `word${i}.x`).join("|");
-    expect(groups(many)).toBeNull();
+  it("keeps every alternative of a long alternation", () => {
+    const many = Array.from({ length: 65 }, (_, i) => `word${i}`);
+    expect(groups(many.map((word) => `${word}.x`).join("|"))).toEqual(
+      many.map((word) => [word, "x"]),
+    );
+    expect(groups(many.map((word) => `^${word}`).join("|"))).toEqual(
+      many.map((word) => [word]),
+    );
+    expect(groups(`${many.join("|")}|.+`)).toBeNull();
   });
 
   it("keeps every literal of a plain literal list past the group limit", () => {
@@ -102,8 +108,8 @@ describe("requiredLiterals", () => {
   });
 
   it("leaves a pattern too long to analyse cheaply unfiltered", () => {
-    expect(groups(`${"a".repeat(4096)}`)).toEqual([["a".repeat(64)]]);
-    expect(groups(`${"a".repeat(4097)}`)).toBeNull();
+    expect(groups("a".repeat(1 << 16))).toEqual([["a".repeat(64)]]);
+    expect(groups("a".repeat((1 << 16) + 1))).toBeNull();
   });
 
   it("gives up on deep nesting instead of recursing without bound", () => {
@@ -164,6 +170,27 @@ describe("lineMayMatch", () => {
     // 101 passes over 1,000 characters: one check.
     expect(checks(many, "a".repeat(1000))).toEqual([true]);
     expect(checks(many, "a".repeat(100))).toEqual([]);
+    // A short line still counts one probe per needle.
+    const huge: PreFilter = {
+      groups: Array.from({ length: 1 << 15 }, (_, i) => [`q${i}`]),
+      ignoreCase: false,
+    };
+    expect(checks(huge, "aa")).toEqual([true]);
+  });
+
+  it("rejects a line shorter than every group without scanning it", () => {
+    const filter: PreFilter = {
+      groups: [["abcd", "x"], ["zz"]],
+      ignoreCase: false,
+    };
+    expect(lineMayMatch(filter, "z")).toBe(false);
+    expect(lineMayMatch(filter, "zz")).toBe(true);
+    // 32,768 needles of two or more characters: no probe of a one-character line.
+    const huge: PreFilter = {
+      groups: Array.from({ length: 1 << 15 }, (_, i) => [`q${i}`]),
+      ignoreCase: false,
+    };
+    expect(checks(huge, "a")).toEqual([]);
   });
 
   it("checks the deadline before every scan of a 64 Ki line", () => {

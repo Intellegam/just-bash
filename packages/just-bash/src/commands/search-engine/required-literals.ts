@@ -18,7 +18,7 @@ export interface PreFilter {
   ignoreCase: boolean;
 }
 
-/** Groups a requirement keeps: past it a concatenation keeps one side, and an alternation other than a plain literal list requires nothing. */
+/** Groups a concatenation multiplies into; past it the concatenation keeps one side. */
 // @banned-pattern-ignore: bounds the prefilter analysis; past it the filter requires less and output is unchanged
 const MAX_GROUPS = 64;
 /** Needles kept per group, the longest first. */
@@ -29,9 +29,9 @@ const MAX_NEEDLES = 8;
 const MAX_NEEDLE_CHARS = 64;
 // @banned-pattern-ignore: bounds the prefilter analysis; past it the pattern is scanned without a filter
 const MAX_DEPTH = 64;
-/** Pattern length analysed; deduplicating long needles costs about its square. */
+/** Pattern length analysed; the analysis costs about the pattern's length. */
 // @banned-pattern-ignore: bounds the prefilter analysis; past it the pattern is scanned without a filter
-const MAX_PATTERN_CHARS = 4096;
+const MAX_PATTERN_CHARS = 1 << 16;
 /** Group pairs combined per pattern, so the analysis stays within milliseconds. */
 // @banned-pattern-ignore: bounds the prefilter analysis; past it the filter requires less and output is unchanged
 const MAX_COMBINATIONS = 4096;
@@ -54,8 +54,9 @@ const CLASS_ESCAPES = "dDwWsSbB";
 
 class UnsupportedPattern extends Error {}
 
+/** An empty group only ever stands alone: an alternation with one collapses to NOTHING. */
 function requiresNothing(requirement: Requirement): boolean {
-  return requirement.some((group) => group.length === 0);
+  return requirement.length === 1 && requirement[0].length === 0;
 }
 
 function capped(group: string[]): string[] {
@@ -79,12 +80,6 @@ function distinct(groups: Requirement): Requirement {
     seen.add(key);
     return true;
   });
-}
-
-function either(left: Requirement, right: Requirement): Requirement {
-  if (requiresNothing(left) || requiresNothing(right)) return NOTHING;
-  const groups = distinct([...left, ...right]);
-  return groups.length > MAX_GROUPS ? NOTHING : groups;
 }
 
 type Atom = { literal: string } | { requirement: Requirement };
@@ -132,18 +127,12 @@ class RequirementParser {
       alternatives.push(this.concatenation(depth));
     }
     if (alternatives.length === 1) return alternatives[0];
-    // A list of plain literals requires one of them past the group limit too;
-    // the pattern length cap bounds how many.
-    if (alternatives.every(({ exact }) => exact)) {
-      return {
-        exact: null,
-        requirement: distinct(alternatives.map(({ exact }) => [exact ?? ""])),
-      };
+    if (alternatives.some(({ requirement }) => requiresNothing(requirement))) {
+      return { exact: null, requirement: NOTHING };
     }
-    let requirement = alternatives[0].requirement;
-    for (let i = 1; i < alternatives.length; i++) {
-      requirement = either(requirement, alternatives[i].requirement);
-    }
+    // One alternative's literals at any count: the pattern length bounds them.
+    // Duplicates are removed once, at the end of the analysis.
+    const requirement = alternatives.flatMap(({ requirement }) => requirement);
     return { exact: null, requirement };
   }
 
@@ -423,6 +412,22 @@ function foldCase(
  * The deadline is checked before a pass over the text once the passes since
  * the last check have scanned `checkEveryChars` characters.
  */
+const shortestMatches = new WeakMap<PreFilter, number>();
+
+/** The fewest characters text needs to hold some group: its longest needle. */
+function shortestMatch(preFilter: PreFilter): number {
+  let shortest = shortestMatches.get(preFilter);
+  if (shortest !== undefined) return shortest;
+  shortest = Number.POSITIVE_INFINITY;
+  for (const needles of preFilter.groups) {
+    let longest = 0;
+    for (const needle of needles) longest = Math.max(longest, needle.length);
+    shortest = Math.min(shortest, longest);
+  }
+  shortestMatches.set(preFilter, shortest);
+  return shortest;
+}
+
 function mayMatch(
   preFilter: PreFilter,
   text: string,
@@ -431,13 +436,15 @@ function mayMatch(
 ): boolean {
   let scanned = 0;
   const beforePass = (): void => {
-    scanned += text.length;
+    // An empty text still costs a probe per needle.
+    scanned += text.length + 1;
     if (scanned < checkEveryChars) return;
     checkpoint?.(true);
     scanned = 0;
   };
   beforePass();
   const haystack = preFilter.ignoreCase ? foldCase(text, beforePass) : text;
+  if (haystack.length < shortestMatch(preFilter)) return false;
   const groups = preFilter.groups;
   for (let g = 0; g < groups.length; g++) {
     const needles = groups[g];
